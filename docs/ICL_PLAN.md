@@ -1,106 +1,125 @@
-# In-Context Cloning + Word Timings for qwen3-tts.cpp
+# In-Context Cloning + Word Timings for qwen3-tts.cpp (v2, post-review)
 
 ## Problem
 
 The current qwen3-tts.cpp implements **x-vector-only cloning** (ECAPA speaker
 embedding): the timbre is cloned but accent/prosody come from the model's
-language prior. This is the official `x_vector_only_mode=true` — the Python
-docs call it "reduced quality". Issue #18 tracks the missing transcript.
+language prior. Issue #18 tracks the missing transcript.
 
-The fix: port the **WavTokenizer encoder** (audio → codec tokens) and implement
-**in-context learning (ICL) prefill**, where the reference audio's codec tokens
-and its transcript serve as context before the target text — carrying accent,
-rhythm, and delivery along with the timbre.
+The fix: port the **codec encoder** (audio → discrete tokens) and implement
+**in-context learning (ICL) prefill** where reference audio tokens and their
+transcript serve as context before the target text.
 
-## Architecture
+## ⚠️ ARCHITECTURE CORRECTION (from checkpoint + Python reference)
 
+The tokenizer encoder is **Mimi** (Kyuzan/Mimi), NOT WavTokenizer:
+- `modeling_qwen3_tts_tokenizer_v2.py:899`: `Qwen3TTSTokenizerV2Encoder(MimiModel)`
+- Activation: **ELU** (no Snake, no weight-norm in the encoder path)
+- Topology: SEANet convs (strides 8,6,5,4 → **25 Hz**) → causal transformer
+  (8L × 512H, **LayerNorm with bias**, **GELU** non-gated MLP, **layer
+  scales**, **sliding window 250**, RoPE θ=10000) → downsample conv
+  [512,512,4] stride 2 → **12.5 Hz** → quantizer
+- The transformer sits at 25 Hz (2× the positions), the stride-2 conv
+  comes **after** the transformer
+- Encoder transformer ≠ decoder pre_tfm: LayerNorm (not RMSNorm), GELU
+  non-gated MLP (not SiLU gated), layer scales present, causal attention
+
+## Converter bug (must fix FIRST)
+
+`convert_tokenizer_to_gguf.py` normalizes only tensors containing the
+substring `"embedding_sum"` — encoder tensors are named `codebook.embed_sum`
+which does NOT contain that substring. Result: **codebooks are written as
+raw EMA sums, not centroids**. The `cluster_usage` tensors needed for
+normalization are also missing from the GGUF.
+
+Python reference (`modeling_mimi.py:1197-1199`):
+```python
+embed = embed_sum / cluster_usage.clamp(min=eps)
 ```
-CURRENT (x-vector only):
-  text tokens → [TTS pad + speaker_embd] → [target text] → generate codes
 
-ICL MODE (full context):
-  text tokens → [ref_text tokens + ref_codec_tokens] → [target text] → generate codes
-                        ↑ accent/prosody travel here
-```
+**Fix**: update the converter to normalize `codebook.embed_sum` tensors
+matching `embed_sum` (not `embedding_sum`), write `cluster_usage` as
+companion tensors, and regenerate the GGUF. Version-bump the GGUF.
 
-## What exists already
+## Quantizer facts (corrected)
 
-- Encoder weights ARE in the GGUF (`tok_enc.*` in `convert_tokenizer_to_gguf.py`)
-  — downsample conv, conv blocks, transformer layers, RVQ codebooks (acoustic
-  + semantic). The inference path simply isn't implemented.
-- The decoder (`audio_tokenizer_decoder.cpp`) is fully ported — same style
-  of GGML graph building.
-- `verify_encoder.py` has the Python-side reference for comparison.
-- Deterministic reference harness (`generate_deterministic_reference.py`)
-  for parity testing.
+- Semantic codebook: **2048 × 256** (not 4096; the config's 4096 is dead)
+- Acoustic RVQ stores **31 layers** (0–30); valid codes = `[:, :16]` =
+  semantic + acoustic[0..14]
+- Semantic and acoustic chains are **parallel** (both quantize the same
+  projected input; residuals chain *within* each path)
+- Codebook search: plain **L2 argmin** (`torch.cdist … argmin`), not cosine
+- Total 16 codebooks consumed by the decoder ✓ (but ordering matters)
 
-## Encoder architecture (from config + weight names)
+## Implementation plan (revised)
 
-1. **Downsample**: strided conv (24kHz → 12.5 frames/s, stride ~1920)
-2. **Conv blocks**: `tok_enc.conv.{i}` + residual `tok_enc.res.{i}.blk.{j}`
-   (Snake activation, weight-normed convs)
-3. **Transformer**: `tok_enc.blk.{i}` — self-attn (Q/K/V/O) + FFN,
-   pre-LayerNorm, 8 layers × 512 hidden × 8 heads
-4. **Quantizer**: two RVQ paths:
-   - Semantic: `tok_enc.vq_semantic` (1 quantizer, dim 256, codebook 4096)
-   - Acoustic: `tok_enc.vq_acoustic` (15 quantizers, dim 256, codebook 2048)
-   - Combined: 16 codebooks total (matches the 16 the decoder consumes)
+### Phase 0: Converter fix + GGUF regeneration (~2 days)
 
-## Implementation plan
+1. Fix `convert_tokenizer_to_gguf.py`:
+   - Change the normalization trigger from `"embedding_sum" in name` to
+     `"embed_sum" in name or "embedding_sum" in name`
+   - Write `cluster_usage` tensors alongside codebooks
+   - Add GGUF version metadata (bump to v2)
+2. Regenerate the tokenizer GGUF from the same HF weights
+3. Update the decoder's codebook loading to use the companion usage
+   tensors when present (backward compatible)
+4. Verify: decode a known codec sequence, confirm audio parity
 
-### Phase 1: WavTokenizer encoder port (~1 week)
+### Phase 1: Mimi encoder port (~2–3 weeks)
 
 `audio_tokenizer_codec_encoder.{h,cpp}` — new files:
 
-```cpp
-struct CodecEncoderConfig {
-    int32_t hidden_size;      // 512
-    int32_t num_layers;       // 8
-    int32_t num_heads;        // 8
-    int32_t codebook_size;    // 2048 (acoustic) / 4096 (semantic)
-    int32_t codebook_dim;     // 256
-    int32_t num_quantizers;   // 15 acoustic + 1 semantic = 16 total
-    int32_t frame_rate;       // 12.5 Hz
-};
-
-class CodecEncoder {
-    // Encode audio (24kHz f32 mono) → 16 codebook token sequences
-    // (N frames × 16 codebooks), same format the decoder consumes.
-    bool encode(const float* audio, int32_t n_samples,
-                std::vector<int32_t>& codec_tokens,  // [n_frames * 16]
-                int32_t& n_frames);
-};
+```
+Architecture:
+  input: f32 audio [n_samples] @ 24kHz
+  ↓ SEANet encoder: conv chain with strides [8, 6, 5, 4], ELU activation
+    → [n_samples/960] positions @ 25 Hz, hidden 512
+  ↓ causal transformer: 8 layers × 512 hidden × 8 heads
+    LayerNorm(w+b), GELU non-gated MLP (fc1→fc2), layer scales,
+    sliding window 250, RoPE θ=10000
+  ↓ downsample conv [512, 512, kernel=4] stride 2
+    → [n_positions/2] positions @ 12.5 Hz
+  ↓ split RVQ:
+    semantic path: input_proj → 1× RVQ (2048-entry codebook, 256-dim)
+    acoustic path: input_proj → 15× RVQ (2048-entry codebooks, 256-dim,
+      residual-chained within acoustic path)
+  output: codec_tokens [n_frames × 16] (1 semantic + 15 acoustic)
 ```
 
-Graph building follows `audio_tokenizer_decoder.cpp`'s pattern:
-- Build GGML compute graph for: downsample → conv blocks → transformer →
-  project to quantizer dims → RVQ (nearest-neighbour lookup per codebook)
-- One-shot inference (no autoregressive generation needed — encoder is
-  a single forward pass)
+Key implementation notes:
+- Causal conv padding: pad left only (Mimi is a causal model)
+- Layer scales: `attn_scale` and `ffn_scale` per layer (scalar multipliers)
+- Sliding window 250: mask attention beyond 250 positions back
+- L2 argmin quantization: for each frame × codebook, find the nearest
+  codebook entry by Euclidean distance
+- Single forward pass (no autoregressive generation)
 
-### Phase 2: ICL prefill (~3 days)
+### Phase 2: ICL prefill (~4–6 days, after redesign)
 
-Modify `build_prefill_graph` in `tts_transformer.cpp`:
+**The prefill layout is ADDITIVE INTERLEAVING, not sequential blocks.**
 
-```cpp
-// New overload accepting reference context:
-bool build_prefill_graph_icl(
-    const int32_t* text_tokens, int32_t n_tokens,     // target text
-    const int32_t* ref_text_tokens, int32_t n_ref_text, // transcript
-    const int32_t* ref_codec_tokens,                    // from Phase 1
-    int32_t n_ref_frames,                               // frames × 16 codebooks
-    const float* speaker_embd,                          // still used
-    int32_t language_id,
-    std::vector<float>& prefill_embd, ...
-);
+From `modeling_qwen3_tts.py:1968–2019` (streaming mode):
+
+```
+Base prefix (identical to x-vector mode, 9 tokens):
+  [role(3)] [think/lang(3–4)] [speaker_embd(1)] [codec_pad ⊕ tts_bos(1)]
+
+ICL context (the new part):
+  text stream: ref_text_tokens + target_text_tokens + tts_eos
+  codec stream: codec_bos_embedding + Σₖ₌₀¹⁵ embedding(ref_code[:,k])
+  
+  Per-position: text_embed[i] ⊕ codec_embed[i] (element-wise SUM)
+  If text is longer: leftover text becomes trailing stream (tts_pad padded)
+  If codec is longer: codec frames without text get tts_pad overlay
 ```
 
-Prefill layout becomes:
-```
-[role tokens (3)] [think/lang (4)] [speaker_embd (1)] [codec pad+BOS (2)]
-[ref_text projected (n)] [ref_codec embedding (n_frames)]
-[target_text projected (n)] [codec BOS]
-```
+Critical details:
+- ref_text must use the same chat template tokenization, sliced `[:, 3:-2]`
+- cb0 of ref codes uses `talker.codec_embd`; cb1–15 use
+  `code_predictor.codec_embd[i-1]`; summed over all 16 per frame
+- The `first_text ⊕ codec_bos` fusion token from x-vector mode does NOT
+  exist in ICL mode
+- Streaming mode matches the existing C++ (non-streaming differs)
 
 ### Phase 3: CLI + C API (~2 days)
 
@@ -110,44 +129,54 @@ Prefill layout becomes:
 ```
 
 ```c
-// C API (upward-compatible addition):
+// C API additions (upward-compatible):
 Qwen3TtsAudio* qwen3_tts_synthesize_in_context(
     Qwen3Tts* tts, const char* text,
     const char* ref_audio_path, const char* ref_text,
     const Qwen3TtsParams* params);
+
+Qwen3TtsAudio* qwen3_tts_synthesize_in_context_samples(
+    Qwen3Tts* tts, const char* text,
+    const float* ref_samples, int32_t n_ref_samples,
+    const char* ref_text,
+    const Qwen3TtsParams* params);
 ```
 
-### Phase 4: Word timings via attention taps (~1 week)
+### Phase 4: Word timings (ICL-mode only, rescoped)
 
-Instrument the transformer decode loop to capture cross-attention between
-generated frames and the text-token positions in the KV cache. Each frame's
-attention peak over text tokens identifies the currently-spoken word.
-Convert frame index → audio time (12.5 frames/s at 24kHz = 80ms per frame).
+**Correction**: In x-vector mode there are NO text-token positions in the
+KV cache (trailing text is added to the step embedding). Only ICL mode
+creates mixed text⊕codec positions that attention can be tapped from.
 
-Expose via:
-```c
-typedef struct Qwen3TtsWordTiming {
-    int32_t text_token_start;  // token index in the text sequence
-    int32_t text_token_end;
-    int32_t frame_start;       // audio frame index
-    int32_t frame_end;
-} Qwen3TtsWordTiming;
+Mechanism: `ggml_set_output` on the post-softmax KQ in `build_step_graph`,
+read back `[n_kv × n_heads]` per layer per frame. Identify which layers/heads
+correlate with word boundaries empirically.
 
-int32_t qwen3_tts_get_word_timings(Qwen3Tts* tts,
-    Qwen3TtsWordTiming* out, int32_t max_count);
-```
+Resolution floor: 80ms per frame (12.5 Hz). Success criterion: **≥1 frame
+accuracy**, not 50ms (which is below the frame resolution).
 
-## Testing
+## Testing strategy
 
-Every phase gets deterministic parity tests against the Python pipeline,
-following the existing `generate_deterministic_reference.py` pattern:
-- Phase 1: codec tokens cosine similarity vs Python encoder
-- Phase 2: prefill logits cosine similarity with ICL-mode Python
-- Phase 3: E2E audio comparison
-- Phase 4: word timing accuracy vs forced alignment
+Extend `generate_deterministic_reference.py` with an ICL mode run:
+- Codec encoder: exact-token match rate (integers, not cosine) with
+  tolerance floor for f16 argmin ties
+- ICL prefill: prefill-logit cosine similarity vs Python ICL mode
+- E2E: audio comparison against Python `generate_voice_clone` output
 
 ## Success criteria
 
-- Clone quality matches DashScope cloud enrollment (accent + prosody preserved)
-- Word timings within 50ms of forced-alignment ground truth
-- No regression on the existing x-vector path (backward compatible)
+- Clone quality: accent/prosody preserved from the reference (the gap
+  between LOCAL and CLOUD that motivated this work)
+- No regression on x-vector path (backward compatible)
+- Word timings: ≥1 frame (80ms) accuracy, ICL mode only
+
+## Effort estimate (revised)
+
+| Phase | Estimate | Notes |
+|---|---|---|
+| 0: Converter fix | 2 days | Blocking dependency |
+| 1: Encoder port | 2–3 weeks | The big rock: Mimi ≠ WavTokenizer |
+| 2: ICL prefill | 4–6 days | Additive interleaving, not sequential |
+| 3: CLI/C API | 2 days | Straightforward |
+| 4: Word timings | 2–3 days infra; accuracy open-ended | ICL only, ≥80ms floor |
+| **Total** | **~4–5 weeks** | |
