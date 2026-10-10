@@ -19,7 +19,7 @@
 #ifndef AUDIO_TOKENIZER_CODEC_ENCODER_H
 #define AUDIO_TOKENIZER_CODEC_ENCODER_H
 
-#include "gguf_loader.h"
+#include "gguf_loader.h"  // GGUFLoader class
 #include <ggml.h>
 #include <vector>
 #include <string>
@@ -127,7 +127,7 @@ public:
     CodecEncoder() = default;
     ~CodecEncoder() = default;
 
-    bool load(const GGUFLoader& gguf);
+    bool load(const qwen3_tts::GGUFLoader& gguf);
     bool is_loaded() const { return model_.loaded; }
 
     /// Encode 24kHz mono f32 audio → codec tokens.
