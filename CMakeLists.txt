@@ -134,6 +134,7 @@ endif()
 # Audio tokenizer decoder library (GGML-based)
 add_library(codec_encoder STATIC
     src/audio_tokenizer_codec_encoder.cpp
+    src/gguf_loader.cpp
 )
 target_include_directories(codec_encoder PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -145,7 +146,6 @@ target_link_directories(codec_encoder PUBLIC
 target_link_libraries(codec_encoder PUBLIC
     ggml
     ggml-base
-    gguf_loader
 )
 
 add_library(audio_tokenizer_decoder STATIC
@@ -246,6 +246,14 @@ add_executable(test_decoder
 )
 target_link_libraries(test_decoder PRIVATE
     audio_tokenizer_decoder
+    Threads::Threads
+)
+
+add_executable(test_codec_encoder
+    tests/test_codec_encoder.cpp
+)
+target_link_libraries(test_codec_encoder PRIVATE
+    codec_encoder
     Threads::Threads
 )
 
