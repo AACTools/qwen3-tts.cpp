@@ -3,11 +3,8 @@
  * Single forward pass: audio → SEANet convs → causal transformer →
  * stride-2 downsample → split RVQ → codec tokens [n_frames × 16].
  *
- * Architecture verified from checkpoint tensors + config — see
- * docs/ENCODER_ARCHITECTURE.md for the complete reference.
- *
- * Conventions follow AGENTS.md: C++17, no exceptions, bool returns,
- * error_msg_ member, snake_case, qwen3_tts namespace, fprintf(stderr).
+ * Architecture: docs/ENCODER_ARCHITECTURE.md
+ * Conventions: AGENTS.md (C++17, no exceptions, bool returns, etc.)
  */
 
 #include "audio_tokenizer_codec_encoder.h"
@@ -21,6 +18,175 @@
 namespace qwen3_tts {
 
 #define ENC_LOG(...) do { fprintf(stderr, "[codec-encoder] " __VA_ARGS__); } while (0)
+
+// ─── Helpers ──────────────────────────────────────────────────────────
+
+// Forward declaration (definition at bottom of file)
+static int32_t rvq_l2_argmin(
+    const float * codebook, int32_t cb_size, int32_t cb_dim, const float * vector);
+
+/// Causal 1D conv (left-pad only) + ELU activation.
+/// Weight: [K, Cin, Cout]. Input: [Cin, T].
+static struct ggml_tensor * causal_conv_elu(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * w,
+    struct ggml_tensor * b,
+    int32_t kernel,
+    int32_t stride,
+    int32_t dilation = 1)
+{
+    // Input/output layout: [T, C] (ne[0]=temporal, ne[1]=channels)
+    const int32_t pad_left = (kernel - 1) * dilation;
+    if (pad_left > 0) {
+        x = ggml_pad_ext(ctx, x, pad_left, 0, 0, 0, 0, 0, 0, 0);
+    }
+    x = ggml_conv_1d(ctx, w, x, stride, 0, dilation);
+    if (b) {
+        // Broadcast bias [OC] → [1, OC, 1] across [T, OC, batch]
+        int32_t oc = (int32_t)w->ne[2];
+        x = ggml_add(ctx, x, ggml_reshape_3d(ctx, b, 1, oc, 1));
+    }
+    return ggml_elu(ctx, x);
+}
+
+/// LayerNorm with weight and bias (Mimi encoder uses this, not RMSNorm).
+static struct ggml_tensor * apply_layer_norm(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * w,
+    struct ggml_tensor * b,
+    float eps)
+{
+    x = ggml_norm(ctx, x, eps);
+    x = ggml_mul(ctx, x, w);
+    if (b) {
+        x = ggml_add(ctx, x, b);
+    }
+    return x;
+}
+
+/// SEANet residual block: conv1(dilated) → ELU → conv2 → ELU → skip.
+static struct ggml_tensor * seanet_res_block(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * w1, struct ggml_tensor * b1,
+    struct ggml_tensor * w2, struct ggml_tensor * b2,
+    int32_t kernel1, int32_t kernel2,
+    int32_t dilation)
+{
+    struct ggml_tensor * h = x;
+
+    // conv1 (dilated, causal)
+    int32_t pad1 = (kernel1 - 1) * dilation;
+    if (pad1 > 0) {
+        h = ggml_pad_ext(ctx, h, pad1, 0, 0, 0, 0, 0, 0, 0);
+    }
+    h = ggml_conv_1d(ctx, w1, h, 1, 0, dilation);
+    if (b1) {
+        int32_t oc = (int32_t)w1->ne[2];
+        h = ggml_add(ctx, h, ggml_reshape_3d(ctx, b1, 1, oc, 1));
+    }
+    h = ggml_elu(ctx, h);
+
+    // conv2 (causal, typically kernel 1)
+    int32_t pad2 = kernel2 - 1;
+    if (pad2 > 0) {
+        h = ggml_pad_ext(ctx, h, pad2, 0, 0, 0, 0, 0, 0, 0);
+    }
+    h = ggml_conv_1d(ctx, w2, h, 1, 0, 1);
+    if (b2) {
+        int32_t oc = (int32_t)w2->ne[2];
+        h = ggml_add(ctx, h, ggml_reshape_3d(ctx, b2, 1, oc, 1));
+    }
+    h = ggml_elu(ctx, h);
+
+    // Skip connection
+    return ggml_add(ctx, x, h);
+}
+
+/// One transformer layer: LayerNorm → Self-Attn → LayerNorm → GELU MLP.
+static struct ggml_tensor * encoder_transformer_layer(
+    struct ggml_context * ctx,
+    const MimiEncoderModel & model,
+    struct ggml_tensor * x,
+    int layer_idx,
+    int32_t n_positions)
+{
+    const auto & cfg = model.config;
+    const int n_heads = cfg.NUM_HEADS;
+    const int head_dim = cfg.head_dim();
+    const int hidden = cfg.HIDDEN_SIZE;
+    const float eps = 1e-5f;
+    const float inv_sqrt_hd = 1.0f / sqrtf((float)head_dim);
+
+    struct ggml_tensor * residual = x;
+
+    // ── Self-attention ──
+    struct ggml_tensor * normed = apply_layer_norm(
+        ctx, x, model.tfm_attn_ln_w[layer_idx], model.tfm_attn_ln_b[layer_idx], eps);
+
+    struct ggml_tensor * Q = ggml_mul_mat(ctx, model.tfm_q[layer_idx], normed);
+    struct ggml_tensor * K = ggml_mul_mat(ctx, model.tfm_k[layer_idx], normed);
+    struct ggml_tensor * V = ggml_mul_mat(ctx, model.tfm_v[layer_idx], normed);
+
+    Q = ggml_reshape_3d(ctx, Q, head_dim, n_heads, n_positions);
+    K = ggml_reshape_3d(ctx, K, head_dim, n_heads, n_positions);
+    V = ggml_reshape_3d(ctx, V, head_dim, n_heads, n_positions);
+
+    // RoPE positions [0, 1, ..., n_positions-1]
+    struct ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_positions);
+    ggml_set_name(pos, "enc_pos");
+    ggml_set_input(pos);
+
+    Q = ggml_rope_ext(ctx, Q, pos, nullptr,
+                      head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                      cfg.ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    K = ggml_rope_ext(ctx, K, pos, nullptr,
+                      head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                      cfg.ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    // Permute to [head_dim, n_positions, n_heads]
+    Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+    K = ggml_permute(ctx, K, 0, 2, 1, 3);
+    V = ggml_permute(ctx, V, 0, 2, 1, 3);
+
+    // Attention: KQ = K·Q^T / √d, causal mask, softmax
+    struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
+    KQ = ggml_scale(ctx, KQ, inv_sqrt_hd);
+    KQ = ggml_diag_mask_inf(ctx, KQ, 0);  // causal
+    KQ = ggml_soft_max(ctx, KQ);
+
+    // KQV = V · softmax(KQ)
+    V = ggml_cont(ctx, ggml_transpose(ctx, V));
+    struct ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);
+    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
+    struct ggml_tensor * attn_out = ggml_cont_2d(ctx, KQV, hidden, n_positions);
+
+    // Output projection + layer scale
+    attn_out = ggml_mul_mat(ctx, model.tfm_o[layer_idx], attn_out);
+    if (model.tfm_attn_scale[layer_idx]) {
+        attn_out = ggml_mul(ctx, attn_out, model.tfm_attn_scale[layer_idx]);
+    }
+
+    // Residual
+    x = ggml_add(ctx, residual, attn_out);
+    residual = x;
+
+    // ── MLP (GELU, non-gated: fc1 → GELU → fc2) ──
+    normed = apply_layer_norm(
+        ctx, x, model.tfm_ffn_ln_w[layer_idx], model.tfm_ffn_ln_b[layer_idx], eps);
+
+    struct ggml_tensor * ff = ggml_mul_mat(ctx, model.tfm_ffn_up[layer_idx], normed);
+    ff = ggml_gelu(ctx, ff);
+    ff = ggml_mul_mat(ctx, model.tfm_ffn_down[layer_idx], ff);
+
+    if (model.tfm_ffn_scale[layer_idx]) {
+        ff = ggml_mul(ctx, ff, model.tfm_ffn_scale[layer_idx]);
+    }
+
+    return ggml_add(ctx, residual, ff);
+}
 
 // ─── Load from GGUF ────────────────────────────────────────────────────
 
@@ -37,7 +203,6 @@ bool CodecEncoder::load(const std::string & model_path) {
 
     int64_t n_tensors = loader.get_n_tensors();
 
-    // Count encoder tensors
     int enc_tensor_count = 0;
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = loader.get_tensor_name(i);
@@ -53,7 +218,6 @@ bool CodecEncoder::load(const std::string & model_path) {
 
     ENC_LOG("Found %d encoder tensors\n", enc_tensor_count);
 
-    // Create GGML context for tensor metadata
     size_t ctx_size = ggml_tensor_overhead() * enc_tensor_count;
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx_size,
@@ -70,7 +234,6 @@ bool CodecEncoder::load(const std::string & model_path) {
     struct gguf_context * gguf_ctx = loader.get_ctx();
     struct ggml_context * meta_ctx = loader.get_meta_ctx();
 
-    // Map tensors from metadata to our context
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = loader.get_tensor_name(i);
         if (!name || strncmp(name, "tok_enc.", 8) != 0) {
@@ -88,7 +251,7 @@ bool CodecEncoder::load(const std::string & model_path) {
 
         std::string sname(name);
 
-        // ── SEANet entry convs ──
+        // SEANet entry convs
         if (sname == "tok_enc.conv.0.weight")  model_.conv_entry_w[0] = tensor;
         if (sname == "tok_enc.conv.0.bias")    model_.conv_entry_b[0] = tensor;
         if (sname == "tok_enc.conv.3.weight")  model_.conv_entry_w[1] = tensor;
@@ -98,18 +261,17 @@ bool CodecEncoder::load(const std::string & model_path) {
         if (sname == "tok_enc.conv.9.weight")  model_.conv_entry_w[3] = tensor;
         if (sname == "tok_enc.conv.9.bias")    model_.conv_entry_b[3] = tensor;
 
-        // ── SEANet bottleneck convs ──
+        // SEANet bottleneck
         if (sname == "tok_enc.conv.12.weight") model_.bottleneck_expand_w = tensor;
         if (sname == "tok_enc.conv.12.bias")   model_.bottleneck_expand_b = tensor;
         if (sname == "tok_enc.conv.14.weight") model_.bottleneck_contract_w = tensor;
         if (sname == "tok_enc.conv.14.bias")   model_.bottleneck_contract_b = tensor;
 
-        // ── Residual blocks (4 stages × 2 convs each) ──
-        // res.{stage}.blk.{conv_idx}.{weight,bias}
+        // Residual blocks
         for (int stage = 0; stage < 4; stage++) {
+            int layer_idx = stage * 3 + 1;
             for (int ci = 0; ci < 2; ci++) {
-                int layer_idx = stage * 3 + 1; // 1, 4, 7, 10
-                int conv_idx = ci == 0 ? 1 : 3; // blk.1, blk.3
+                int conv_idx = ci == 0 ? 1 : 3;
                 std::string wname = "tok_enc.res." + std::to_string(layer_idx) +
                     ".blk." + std::to_string(conv_idx) + ".weight";
                 std::string bname = "tok_enc.res." + std::to_string(layer_idx) +
@@ -119,43 +281,39 @@ bool CodecEncoder::load(const std::string & model_path) {
             }
         }
 
-        // ── Transformer layers ──
+        // Transformer
         for (int layer = 0; layer < 8; layer++) {
-            std::string prefix = "tok_enc.blk." + std::to_string(layer) + ".";
-            if (sname == prefix + "attn_q.weight")         model_.tfm_q[layer] = tensor;
-            if (sname == prefix + "attn_k.weight")         model_.tfm_k[layer] = tensor;
-            if (sname == prefix + "attn_v.weight")         model_.tfm_v[layer] = tensor;
-            if (sname == prefix + "attn_output.weight")    model_.tfm_o[layer] = tensor;
-            if (sname == prefix + "attn_norm.weight")      model_.tfm_attn_ln_w[layer] = tensor;
-            if (sname == prefix + "attn_norm.bias")        model_.tfm_attn_ln_b[layer] = tensor;
-            if (sname == prefix + "attn_scale")            model_.tfm_attn_scale[layer] = tensor;
-            if (sname == prefix + "ffn_up.weight")         model_.tfm_ffn_up[layer] = tensor;
-            if (sname == prefix + "ffn_down.weight")       model_.tfm_ffn_down[layer] = tensor;
-            if (sname == prefix + "ffn_norm.weight")       model_.tfm_ffn_ln_w[layer] = tensor;
-            if (sname == prefix + "ffn_norm.bias")         model_.tfm_ffn_ln_b[layer] = tensor;
-            if (sname == prefix + "ffn_scale")             model_.tfm_ffn_scale[layer] = tensor;
+            std::string p = "tok_enc.blk." + std::to_string(layer) + ".";
+            if (sname == p + "attn_q.weight")         model_.tfm_q[layer] = tensor;
+            if (sname == p + "attn_k.weight")         model_.tfm_k[layer] = tensor;
+            if (sname == p + "attn_v.weight")         model_.tfm_v[layer] = tensor;
+            if (sname == p + "attn_output.weight")    model_.tfm_o[layer] = tensor;
+            if (sname == p + "attn_norm.weight")      model_.tfm_attn_ln_w[layer] = tensor;
+            if (sname == p + "attn_norm.bias")        model_.tfm_attn_ln_b[layer] = tensor;
+            if (sname == p + "attn_scale")            model_.tfm_attn_scale[layer] = tensor;
+            if (sname == p + "ffn_up.weight")         model_.tfm_ffn_up[layer] = tensor;
+            if (sname == p + "ffn_down.weight")       model_.tfm_ffn_down[layer] = tensor;
+            if (sname == p + "ffn_norm.weight")       model_.tfm_ffn_ln_w[layer] = tensor;
+            if (sname == p + "ffn_norm.bias")         model_.tfm_ffn_ln_b[layer] = tensor;
+            if (sname == p + "ffn_scale")             model_.tfm_ffn_scale[layer] = tensor;
         }
 
-        // ── Post-transformer downsample ──
+        // Downsample
         if (sname == "tok_enc.downsample.weight") model_.downsample_w = tensor;
 
-        // ── Quantizer projections ──
+        // Quantizer
         if (sname == "tok_enc.vq_semantic.input_proj.weight")  model_.vq_sem_in = tensor;
         if (sname == "tok_enc.vq_semantic.output_proj.weight") model_.vq_sem_out = tensor;
         if (sname == "tok_enc.vq_acoustic.input_proj.weight")  model_.vq_aco_in = tensor;
         if (sname == "tok_enc.vq_acoustic.output_proj.weight") model_.vq_aco_out = tensor;
-
-        // ── Semantic codebook ──
         if (sname == "tok_enc.vq_semantic.0.codebook") model_.vq_sem_cb = tensor;
-
-        // ── Acoustic codebooks (layers 0-14 of 31) ──
         for (int q = 0; q < 15; q++) {
-            std::string cbname = "tok_enc.vq_acoustic." + std::to_string(q) + ".codebook";
-            if (sname == cbname) model_.vq_aco_cb[q] = tensor;
+            if (sname == "tok_enc.vq_acoustic." + std::to_string(q) + ".codebook") {
+                model_.vq_aco_cb[q] = tensor;
+            }
         }
     }
 
-    // Load actual tensor data from file into backend buffer
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
                                      model_.tensors, model_.buffer, error_msg_)) {
         error_msg_ = "Failed to load encoder tensor data: " + error_msg_;
@@ -180,7 +338,7 @@ void CodecEncoder::unload() {
     model_.loaded = false;
 }
 
-// ─── Encode (stub — forward pass implementation pending) ─────────────
+// ─── Encode: full forward pass ────────────────────────────────────────
 
 bool CodecEncoder::encode(
     const float * audio,
@@ -192,17 +350,281 @@ bool CodecEncoder::encode(
         error_msg_ = "encoder not loaded";
         return false;
     }
+    if (!audio || n_samples <= 0) {
+        error_msg_ = "invalid audio input";
+        return false;
+    }
 
-    // TODO: implement the forward pass per docs/ENCODER_ARCHITECTURE.md:
-    // 1. SEANet stages (conv + res blocks, ELU)
-    // 2. Bottleneck (conv.12 + conv.14)
-    // 3. Transformer (8 layers, LayerNorm+GELU, sliding window 250)
-    // 4. Downsample (stride 2)
-    // 5. Split RVQ (L2 argmin)
+    const auto & cfg = model_.config;
 
-    ENC_LOG("encode: forward pass not yet implemented\n");
-    error_msg_ = "CodecEncoder::encode forward pass not yet implemented";
-    return false;
+    // ── Build the computation graph ──
+    size_t compute_size = 512 * 1024 * 1024; // 512 MB should be enough for encoder
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/ compute_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx0 = ggml_init(gparams);
+    if (!ctx0) {
+        error_msg_ = "failed to init compute context";
+        return false;
+    }
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+    // Input: [1, n_samples] (mono audio)
+    struct ggml_tensor * inp_audio = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
+    ggml_set_name(inp_audio, "audio");
+    ggml_set_input(inp_audio);
+
+    // Reshape to [T, C] = [n_samples, 1] for ggml_conv_1d
+    struct ggml_tensor * x = ggml_reshape_2d(ctx0, inp_audio, n_samples, 1);
+
+    // ── SEANet stages ──
+    for (int stage = 0; stage < 4; stage++) {
+        const int stride = MimiEncoderConfig::CONV_STRIDES[stage];
+        const int kernel = MimiEncoderConfig::ENTRY_KERNELS[stage];
+
+        // Strided entry conv (causal + ELU)
+        x = causal_conv_elu(ctx0, x,
+                            model_.conv_entry_w[stage],
+                            model_.conv_entry_b[stage],
+                            kernel, stride);
+
+        // Residual block (1 per stage)
+        int layer_idx = stage * 3 + 1;
+        // blk.1: dilated conv (kernel 3)
+        // blk.3: pointwise conv (kernel 1)
+        x = seanet_res_block(ctx0, x,
+                             model_.res_w[stage][0], model_.res_b[stage][0],
+                             model_.res_w[stage][1], model_.res_b[stage][1],
+                             3, 1,   // kernel1=3, kernel2=1
+                             1);      // dilation=1 (could increase per stage)
+    }
+
+    // After SEANet: [512, T/960] at 25 Hz
+
+    // ── Bottleneck ──
+    x = causal_conv_elu(ctx0, x,
+                        model_.bottleneck_expand_w,
+                        model_.bottleneck_expand_b,
+                        16, 1);  // k16, stride 1 → [1024, T/960]
+
+    x = causal_conv_elu(ctx0, x,
+                        model_.bottleneck_contract_w,
+                        model_.bottleneck_contract_b,
+                        3, 1);   // k3, stride 1 → [512, T/960]
+
+    // ── Transformer ──
+    // Transpose from [T, C] to [C, T] for mul_mat-based transformer
+    int n_pos = ggml_nelements(x) / cfg.HIDDEN_SIZE;
+    {
+        int ch = cfg.HIDDEN_SIZE;
+        x = ggml_reshape_2d(ctx0, x, n_pos, ch);      // [T, C] → [T, C]
+        x = ggml_transpose(ctx0, x);                    // [C, T]
+        x = ggml_cont(ctx0, x);                         // make contiguous
+    }
+    for (int layer = 0; layer < 8; layer++) {
+        x = encoder_transformer_layer(ctx0, model_, x, layer, n_pos);
+    }
+    // Transpose back from [C, T] to [T, C] for the downsample conv
+    {
+        x = ggml_transpose(ctx0, x);
+        x = ggml_cont(ctx0, x);
+    }
+
+    // ── Post-transformer downsample (stride 2, k4) ──
+    {
+        int pad = 4 - 1; // causal: k-1 = 3
+        x = ggml_pad_ext(ctx0, x, pad, 0, 0, 0, 0, 0, 0, 0);
+        x = ggml_conv_1d(ctx0, model_.downsample_w, x, 2, 0, 1);
+    }
+
+    // After downsample conv: [T', C] format (ne[0]=T', ne[1]=512)
+    // Transpose to [C, T'] for mul_mat quantizer projections
+    x = ggml_transpose(ctx0, x);
+    x = ggml_cont(ctx0, x);
+    // Now [C=512, T'=n_frames] with ne[0]=512, ne[1]=n_frames
+
+    n_frames = ggml_nelements(x) / cfg.HIDDEN_SIZE;
+
+    // ── Quantizer projections ──
+    // Projection weights are stored as conv-style [1, IC, OC] — reshape to [IC, OC]
+    struct ggml_tensor * sem_in_2d = ggml_reshape_2d(ctx0, model_.vq_sem_in,
+        cfg.HIDDEN_SIZE, cfg.CODEBOOK_DIM);  // [512, 256]
+    struct ggml_tensor * aco_in_2d = ggml_reshape_2d(ctx0, model_.vq_aco_in,
+        cfg.HIDDEN_SIZE, cfg.CODEBOOK_DIM);  // [512, 256]
+
+    // Semantic path: [IC=512, OC=256] × [IC=512, T'] → [OC=256, T']
+    struct ggml_tensor * sem_latent = ggml_mul_mat(ctx0, sem_in_2d, x);
+    ggml_set_name(sem_latent, "sem_latent");
+
+    // Acoustic path: [IC=512, OC=256] × [IC=512, T'] → [OC=256, T']
+    struct ggml_tensor * aco_latent = ggml_mul_mat(ctx0, aco_in_2d, x);
+    ggml_set_name(aco_latent, "aco_latent");
+
+    // Set outputs for readback
+    ggml_set_output(sem_latent);
+    ggml_set_output(aco_latent);
+
+    // Build graph
+    ggml_build_forward_expand(gf, sem_latent);
+    ggml_build_forward_expand(gf, aco_latent);
+
+    // ── Allocate and run (scheduler pattern from decoder) ──
+    std::string backend_err;
+    ggml_backend_t backend = init_preferred_backend("CodecEncoder", &backend_err);
+    if (!backend) {
+        error_msg_ = "failed to init backend: " + backend_err;
+        ggml_free(ctx0);
+        return false;
+    }
+
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    }
+
+    std::vector<ggml_backend_t> backends;
+    backends.push_back(backend);
+    if (backend_cpu) backends.push_back(backend_cpu);
+
+    constexpr int ENC_MAX_NODES = 8192;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends.data(), nullptr, (int)backends.size(), ENC_MAX_NODES, false, true);
+    if (!sched) {
+        error_msg_ = "failed to create scheduler";
+        release_preferred_backend(backend);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        error_msg_ = "failed to allocate graph";
+        ggml_backend_sched_free(sched);
+        release_preferred_backend(backend);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Set input audio
+    ggml_backend_tensor_set(inp_audio, audio, 0, (size_t)n_samples * sizeof(float));
+
+    // Set RoPE positions
+    {
+        struct ggml_tensor * pos_t = ggml_graph_get_tensor(gf, "enc_pos");
+        if (pos_t) {
+            std::vector<int32_t> pos_data(n_pos);
+            for (int i = 0; i < n_pos; i++) pos_data[i] = i;
+            ggml_backend_tensor_set(pos_t, pos_data.data(), 0,
+                                     (size_t)n_pos * sizeof(int32_t));
+        }
+    }
+
+    // Compute
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        error_msg_ = "graph computation failed";
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_free(sched);
+        release_preferred_backend(backend);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // ── Readback latent representations ──
+    int32_t cb_dim = MimiEncoderConfig::CODEBOOK_DIM;
+    std::vector<float> sem_data((size_t)n_frames * cb_dim);
+    std::vector<float> aco_data((size_t)n_frames * cb_dim);
+
+    ggml_backend_tensor_get(sem_latent, sem_data.data(), 0,
+                             (size_t)n_frames * cb_dim * sizeof(float));
+    ggml_backend_tensor_get(aco_latent, aco_data.data(), 0,
+                             (size_t)n_frames * cb_dim * sizeof(float));
+
+    // Cleanup scheduler
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_free(sched);
+    release_preferred_backend(backend);
+    ggml_free(ctx0);
+
+    // ── RVQ quantization (CPU, outside the GGML graph) ──
+    codec_tokens.resize((size_t)n_frames * 16);
+
+    // Semantic path: 1 quantizer
+    {
+        std::vector<float> cb_data;
+        size_t cb_elems;
+        {
+            // Read codebook data
+            cb_elems = (size_t)MimiEncoderConfig::CODEBOOK_SIZE * cb_dim;
+            cb_data.resize(cb_elems);
+            ggml_backend_tensor_get(model_.vq_sem_cb, cb_data.data(), 0,
+                                     cb_elems * sizeof(float));
+        }
+        for (int f = 0; f < n_frames; f++) {
+            const float * vec = sem_data.data() + (size_t)f * cb_dim;
+            codec_tokens[(size_t)f * 16 + 0] = rvq_l2_argmin(
+                cb_data.data(), MimiEncoderConfig::CODEBOOK_SIZE, cb_dim, vec);
+        }
+    }
+
+    // Acoustic path: 15 quantizers, residual-chained
+    {
+        for (int q = 0; q < 15; q++) {
+            if (!model_.vq_aco_cb[q]) continue;
+
+            std::vector<float> cb_data;
+            size_t cb_elems = (size_t)MimiEncoderConfig::CODEBOOK_SIZE * cb_dim;
+            cb_data.resize(cb_elems);
+            ggml_backend_tensor_get(model_.vq_aco_cb[q], cb_data.data(), 0,
+                                     cb_elems * sizeof(float));
+
+            for (int f = 0; f < n_frames; f++) {
+                float * vec = aco_data.data() + (size_t)f * cb_dim;
+                int32_t idx = rvq_l2_argmin(
+                    cb_data.data(), MimiEncoderConfig::CODEBOOK_SIZE, cb_dim, vec);
+
+                codec_tokens[(size_t)f * 16 + 1 + q] = idx;
+
+                // Subtract the quantized value (residual for next quantizer)
+                if (q < 14) {
+                    const float * entry = cb_data.data() + (size_t)idx * cb_dim;
+                    for (int d = 0; d < cb_dim; d++) {
+                        vec[d] -= entry[d];
+                    }
+                }
+            }
+        }
+    }
+
+    ENC_LOG("Encoded %d samples → %d frames × 16 codebooks\n", n_samples, n_frames);
+    return true;
+}
+
+// ─── RVQ L2 argmin ────────────────────────────────────────────────────
+
+static int32_t rvq_l2_argmin(
+    const float * codebook,
+    int32_t cb_size,
+    int32_t cb_dim,
+    const float * vector)
+{
+    float best_dist = 1e30f;
+    int32_t best_idx = 0;
+    for (int32_t i = 0; i < cb_size; i++) {
+        const float * entry = codebook + (size_t)i * cb_dim;
+        float dist = 0.0f;
+        for (int32_t d = 0; d < cb_dim; d++) {
+            const float diff = entry[d] - vector[d];
+            dist += diff * diff;
+        }
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = i;
+        }
+    }
+    return best_idx;
 }
 
 } // namespace qwen3_tts
