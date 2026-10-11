@@ -1262,28 +1262,30 @@ bool TTSTransformer::build_prefill_graph_icl(
 
     // ── Build the ICL context: additive interleaving of text ⊕ codec ──
     //
-    // Text stream: ref_text[3:-2] + target_text[3:] + tts_eos
-    //   (strip chat template from ref_text, keep target text after role tokens)
+    // Text stream: ref_text[3:-5] + target_text[3:-5] + tts_eos
+    //   (strip chat template from both: 3-token role prefix and the
+    //   5-token tail <|im_end|> \n <|im_start|> assistant \n)
     // Codec stream: codec_bos + Σₖ embedding(ref_code[:,k]) per frame
     //
     // Per-position: text_proj(text[i]) + codec_embedding[i]
     // If text longer: leftover text becomes trailing (with tts_pad)
     // If codec longer: codec frames without text get tts_pad overlay
 
-    // Prepare text tokens (strip role prefix from both ref and target)
-    int32_t ref_text_start = 3; // skip <|im_start|>, assistant, \n
     // encode_for_tts emits a 5-token tail: <|im_end|> \n <|im_start|> assistant \n
-    // Strip all 5 to get the clean transcript
+    // Strip all 5 to get the clean transcript (matches Python's [:, 3:-5])
+    int32_t ref_text_start = 3; // skip <|im_start|>, assistant, \n
     int32_t ref_text_end = n_ref_text - 5;
     if (ref_text_end < ref_text_start) ref_text_end = ref_text_start;
 
     int32_t target_start = 3; // skip role tokens from target
+    int32_t target_end = n_tokens - 5;
+    if (target_end < target_start) target_end = target_start;
 
     std::vector<int32_t> combined_text;
     for (int32_t i = ref_text_start; i < ref_text_end && i < n_ref_text; i++) {
         combined_text.push_back(ref_text_tokens[i]);
     }
-    for (int32_t i = target_start; i < n_tokens; i++) {
+    for (int32_t i = target_start; i < target_end && i < n_tokens; i++) {
         combined_text.push_back(text_tokens[i]);
     }
     combined_text.push_back(cfg.tts_eos_token_id); // text stream ends with EOS
