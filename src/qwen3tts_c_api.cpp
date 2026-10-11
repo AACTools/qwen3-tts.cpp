@@ -245,7 +245,6 @@ const char * qwen3_tts_get_error(const Qwen3Tts * tts) {
     return tts->last_error.c_str();
 }
 
-} // extern "C"
 
 Qwen3TtsAudio* qwen3_tts_synthesize_in_context(
     Qwen3Tts* tts,
@@ -254,11 +253,34 @@ Qwen3TtsAudio* qwen3_tts_synthesize_in_context(
     const char* ref_text,
     const Qwen3TtsParams* params)
 {
-    if (!tts || !text || !reference_audio_path || !ref_text) return nullptr;
-    // ICL mode: encode reference audio to codec tokens, then use
-    // generate_icl with the transcript for full context cloning.
-    // This is a stub — the full implementation wires the codec encoder
-    // + tokenizer through Qwen3TTS pipeline.
-    fprintf(stderr, "[qwen3-tts] ICL synthesis: not yet fully wired in C API\n");
-    return nullptr;
+    if (!tts || !text || !reference_audio_path || !ref_text || !params) return nullptr;
+
+    Qwen3TtsParams p = *params;
+    qwen3_tts::tts_params tp;
+    tp.max_audio_tokens = p.max_audio_tokens;
+    tp.temperature = p.temperature;
+    tp.top_k = p.top_k;
+    tp.repetition_penalty = p.repetition_penalty;
+    tp.language_id = p.language_id;
+
+    qwen3_tts::tts_result result = tts->engine.synthesize_in_context(
+        text, reference_audio_path, ref_text, tp);
+
+    if (!result.success || result.audio.empty()) {
+        if (!result.error_msg.empty()) {
+            fprintf(stderr, "[qwen3-tts] ICL synthesis failed: %s\n", result.error_msg.c_str());
+        }
+        return nullptr;
+    }
+
+    Qwen3TtsAudio* audio = new Qwen3TtsAudio();
+    audio->n_samples = (int32_t)result.audio.size();
+    audio->sample_rate = result.sample_rate;
+    audio->samples = new float[result.audio.size()];
+    memcpy((void*)audio->samples, result.audio.data(), result.audio.size() * sizeof(float));
+    return audio;
 }
+
+} // extern "C"
+
+

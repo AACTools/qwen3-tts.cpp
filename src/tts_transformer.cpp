@@ -1251,7 +1251,9 @@ bool TTSTransformer::build_prefill_graph_icl(
 
     // Prepare text tokens (strip role prefix from both ref and target)
     int32_t ref_text_start = 3; // skip <|im_start|>, assistant, \n
-    int32_t ref_text_end = n_ref_text - 2; // skip <|im_end|>, \n (if present)
+    // encode_for_tts emits a 5-token tail: <|im_end|> \n <|im_start|> assistant \n
+    // Strip all 5 to get the clean transcript
+    int32_t ref_text_end = n_ref_text - 5;
     if (ref_text_end < ref_text_start) ref_text_end = ref_text_start;
 
     int32_t target_start = 3; // skip role tokens from target
@@ -1281,15 +1283,12 @@ bool TTSTransformer::build_prefill_graph_icl(
                 return false;
             }
 
-            // cb1-15: sum into the same row
+            // cb1-15: sum into the same row (using code_pred_embd, matching
+            // the generation-time embedding lookups exactly)
             for (int32_t cb = 1; cb < 16 && cb < cfg.n_codebooks; cb++) {
                 int32_t token = ref_codec_tokens[(size_t)f * 16 + cb];
-                // Codebook 1-15 embeddings: look up and add
                 std::vector<float> cb_row(hidden_size);
-                // Use codec_embd for now (single embedding table for all codebooks
-                // in this simplified implementation — the code predictor has
-                // separate tables but they're accessed via predict_codes path)
-                if (!lookup_single_embedding_row(model_.codec_embd, token, cb_row.data())) {
+                if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], token, cb_row.data())) {
                     return false;
                 }
                 for (int32_t h = 0; h < hidden_size; h++) {
@@ -3123,6 +3122,7 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
     }
 
     const int32_t prefill_len = (int32_t)(prefill_embd.size() / cfg.hidden_size);
+    const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
 
     const int32_t required_ctx = prefill_len + max_len + 8;
     if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
@@ -3132,123 +3132,151 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
     }
     clear_kv_cache();
 
-    // Forward the prefill (same as x-vector mode from here on)
+    // Forward the prefill (identical to x-vector mode from here on)
     std::vector<float> hidden_out;
     std::vector<float> logits;
     if (!forward_prefill(prefill_embd.data(), prefill_len, 0, hidden_out, &logits)) {
-        error_msg_ = "ICL forward_prefill failed: " + error_msg_;
         return false;
     }
 
+    // ── Autoregressive loop: EXACT copy of x-vector generate() ──
     output.clear();
-    output.reserve((size_t)max_len * cfg.n_codebooks);
+    output.reserve(max_len * cfg.n_codebooks);
 
-    // Autoregressive generation loop (mirrors the x-vector generate() loop)
-    for (int32_t step = 0; step < max_len; step++) {
-        // Repetition penalty on codebook 0 logits
-        if (repetition_penalty != 1.0f && !output.empty()) {
-            size_t n_past_cb0 = output.size() / cfg.n_codebooks;
-            for (int32_t i = 0; i < cfg.codec_vocab_size; i++) {
-                for (size_t p = 0; p < n_past_cb0 && p < 32; p++) {
-                    int32_t past_token = output[(size_t)p * cfg.n_codebooks];
-                    if (past_token == i) {
-                        if (logits[i] > 0.0f) {
-                            logits[i] /= repetition_penalty;
-                        } else {
-                            logits[i] *= repetition_penalty;
-                        }
-                        break;
+    int32_t n_past = prefill_len;
+    std::vector<int32_t> frame_codes(cfg.n_codebooks);
+    std::unordered_set<int32_t> generated_cb0_tokens;
+    const int32_t suppress_start = cfg.codec_vocab_size - 1024;
+
+    std::vector<float> probs(cfg.codec_vocab_size);
+    std::vector<float> step_embd(cfg.hidden_size, 0.0f);
+    std::vector<float> embd_row(cfg.hidden_size);
+
+    for (int frame = 0; frame < max_len; ++frame) {
+        // Suppress special tokens
+        for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
+            if (i != cfg.codec_eos_id) {
+                logits[i] = -INFINITY;
+            }
+        }
+
+        // Repetition penalty (full history, same as x-vector)
+        if (repetition_penalty != 1.0f) {
+            for (int32_t tok : generated_cb0_tokens) {
+                if (tok >= 0 && tok < cfg.codec_vocab_size) {
+                    if (logits[tok] > 0.0f) {
+                        logits[tok] /= repetition_penalty;
+                    } else {
+                        logits[tok] *= repetition_penalty;
                     }
                 }
             }
         }
 
-        // Sample codebook 0
-        int32_t cb0_token;
+        // Sample cb0 (identical to x-vector)
+        int32_t next_token;
         if (temperature <= 0.0f) {
-            // Greedy
-            cb0_token = 0;
-            float best = logits[0];
-            for (int32_t i = 1; i < cfg.codec_vocab_size; i++) {
-                if (logits[i] > best) {
-                    best = logits[i];
-                    cb0_token = i;
+            next_token = argmax(logits.data(), cfg.codec_vocab_size);
+        } else {
+            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                logits[i] /= temperature;
+            }
+            if (top_k > 0 && top_k < cfg.codec_vocab_size) {
+                std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
+                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                    scored[i] = {logits[i], i};
+                }
+                std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
+                    [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+                        return a.first > b.first;
+                    });
+                float threshold = scored[top_k - 1].first;
+                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                    if (logits[i] < threshold) {
+                        logits[i] = -INFINITY;
+                    }
                 }
             }
-        } else {
-            // Top-k sampling (same as x-vector mode)
-            std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
-            for (int32_t i = 0; i < cfg.codec_vocab_size; i++) {
-                scored[i] = {logits[i], i};
-            }
-            std::partial_sort(scored.begin(), scored.begin() + std::min(top_k, cfg.codec_vocab_size),
-                             scored.end(), std::greater<>());
-            // Softmax over top-k
-            float max_logit = scored[0].first;
-            std::vector<float> probs(std::min(top_k, cfg.codec_vocab_size));
-            float sum = 0.0f;
-            for (size_t i = 0; i < probs.size(); i++) {
-                probs[i] = expf((scored[i].first - max_logit) / temperature);
+            float max_logit = *std::max_element(logits.data(), logits.data() + cfg.codec_vocab_size);
+            double sum = 0.0;
+            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                probs[i] = expf(logits[i] - max_logit);
                 sum += probs[i];
             }
-            for (auto & p : probs) p /= sum;
-            // Sample
-            float r = (float)rand() / RAND_MAX;
-            float cum = 0.0f;
-            cb0_token = scored[0].second;
-            for (size_t i = 0; i < probs.size(); i++) {
-                cum += probs[i];
-                if (r < cum) {
-                    cb0_token = scored[i].second;
-                    break;
-                }
+            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                probs[i] = (float)(probs[i] / sum);
             }
+            std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
+            next_token = dist(rng_);
         }
 
-        // Check for EOS
-        if (cb0_token == cfg.codec_eos_id) {
+        if (next_token == cfg.codec_eos_id) {
             break;
         }
 
-        // Code predictor for codebooks 1-15 (same as x-vector mode)
-        std::vector<int32_t> cb_rest;
-        if (!predict_codes_autoregressive(hidden_out.data(), cb0_token, cb_rest,
+        frame_codes[0] = next_token;
+        generated_cb0_tokens.insert(next_token);
+
+        // Code predictor: use last_hidden_ (set by forward_prefill/forward_step)
+        std::vector<int32_t> codes_1_15;
+        if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15,
                                             temperature, top_k)) {
-            error_msg_ = "ICL: code predictor failed: " + error_msg_;
             return false;
         }
 
-        // Store output
-        output.push_back(cb0_token);
-        for (int32_t cb = 0; cb < 15; cb++) {
-            output.push_back(cb_rest[cb]);
+        for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
+            frame_codes[cb] = codes_1_15[cb - 1];
         }
 
-        // Forward step for next frame
-        if (step + 1 < max_len) {
-            // Build step embedding from hidden state + trailing text
-            std::vector<float> step_embd(cfg.hidden_size);
-            memcpy(step_embd.data(), hidden_out.data(), cfg.hidden_size * sizeof(float));
+        for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+            output.push_back(frame_codes[cb]);
+        }
 
-            int32_t trailing_idx = step + 1;
-            if (trailing_idx < (int32_t)(trailing_text_hidden.size() / cfg.hidden_size)) {
-                const float * trow = trailing_text_hidden.data() + (size_t)trailing_idx * cfg.hidden_size;
-                for (int32_t h = 0; h < cfg.hidden_size; h++) {
-                    step_embd[h] += trow[h];
-                }
-            }
+        if (frame + 1 >= max_len) {
+            break;
+        }
 
-            std::vector<float> step_hidden;
-            if (!forward_step(step_embd.data(), prefill_len + step, step_hidden, &logits)) {
-                error_msg_ = "ICL: forward_step failed at step " + std::to_string(step);
+        // Step embedding: codec embedding lookups (NOT hidden states)
+        std::fill(step_embd.begin(), step_embd.end(), 0.0f);
+
+        // cb0 from talker codec_embd
+        if (!lookup_single_embedding_row(model_.codec_embd, frame_codes[0], embd_row.data())) {
+            return false;
+        }
+        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
+            step_embd[h] = embd_row[h];
+        }
+
+        // cb1-15 from code_pred_embd
+        for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
+            int32_t code_token = frame_codes[cb];
+            if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code_token, embd_row.data())) {
                 return false;
             }
-            hidden_out = step_hidden;
+            for (int32_t h = 0; h < cfg.hidden_size; ++h) {
+                step_embd[h] += embd_row[h];
+            }
         }
+
+        // Trailing text (empty in ICL mode — use tts_pad)
+        const float * trailing_row = (frame < trailing_len)
+            ? trailing_text_hidden.data() + (size_t)frame * cfg.hidden_size
+            : tts_pad_embed.data();
+        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
+            step_embd[h] += trailing_row[h];
+        }
+
+        // Forward step: logits go into `logits`, NOT hidden
+        if (!forward_step(step_embd.data(), n_past, logits)) {
+            return false;
+        }
+
+        n_past++;
     }
 
     return true;
 }
+
 bool TTSTransformer::forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
                               std::vector<float> & output) {
     return forward_text(tokens, n_tokens, nullptr, n_past, output);

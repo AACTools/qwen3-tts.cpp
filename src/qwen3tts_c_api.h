@@ -100,11 +100,6 @@ Qwen3TtsAudio* qwen3_tts_synthesize_with_embedding(
 /* Get last error message (or empty string) */
 const char* qwen3_tts_get_error(const Qwen3Tts* tts);
 
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* QWEN3TTS_C_API_H */
 
 /* Synthesize with in-context voice cloning (ICL mode).
  * Combines the speaker embedding AND reference codec tokens + transcript
@@ -117,3 +112,9 @@ Qwen3TtsAudio* qwen3_tts_synthesize_in_context(
     const char* reference_audio_path,
     const char* ref_text,
     const Qwen3TtsParams* params);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* QWEN3TTS_C_API_H */
