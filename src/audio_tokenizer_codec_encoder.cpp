@@ -21,6 +21,14 @@ namespace qwen3_tts {
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
+// Debug: print tensor shape
+static void print_shape(const char * label, struct ggml_tensor * t) {
+    if (!t) { fprintf(stderr, "  %s: NULL\n", label); return; }
+    fprintf(stderr, "  %s: [%lld, %lld, %lld, %lld] type=%d\n",
+            label, (long long)t->ne[0], (long long)t->ne[1],
+            (long long)t->ne[2], (long long)t->ne[3], (int)t->type);
+}
+
 // Forward declaration (definition at bottom of file)
 static int32_t rvq_l2_argmin(
     const float * codebook, int32_t cb_size, int32_t cb_dim, const float * vector);
@@ -189,6 +197,33 @@ static struct ggml_tensor * encoder_transformer_layer(
 }
 
 // ─── Load from GGUF ────────────────────────────────────────────────────
+
+
+/// Read a GGML tensor into a float vector, converting from F16 if needed.
+static bool read_tensor_as_f32(
+    struct ggml_tensor * tensor,
+    std::vector<float> & out,
+    std::string & error)
+{
+    size_t nbytes = ggml_nbytes(tensor);
+    if (tensor->type == GGML_TYPE_F32) {
+        out.resize(nbytes / sizeof(float));
+        ggml_backend_tensor_get(tensor, out.data(), 0, nbytes);
+    } else if (tensor->type == GGML_TYPE_F16) {
+        size_t n_f16 = nbytes / sizeof(uint16_t);
+        std::vector<uint16_t> f16_buf(n_f16);
+        ggml_backend_tensor_get(tensor, f16_buf.data(), 0, nbytes);
+        out.resize(n_f16);
+        for (size_t i = 0; i < n_f16; i++) {
+            out[i] = ggml_fp16_to_fp32(f16_buf[i]);
+        }
+    } else {
+        error = "unsupported tensor type for read_tensor_as_f32: " +
+                std::to_string((int)tensor->type);
+        return false;
+    }
+    return true;
+}
 
 bool CodecEncoder::load(const std::string & model_path) {
     unload();
@@ -379,6 +414,7 @@ bool CodecEncoder::encode(
 
     // Reshape to [T, C] = [n_samples, 1] for ggml_conv_1d
     struct ggml_tensor * x = ggml_reshape_2d(ctx0, inp_audio, n_samples, 1);
+    ENC_LOG("input: "); print_shape("x", x);
 
     // ── SEANet stages ──
     for (int stage = 0; stage < 4; stage++) {
@@ -400,6 +436,7 @@ bool CodecEncoder::encode(
                              model_.res_w[stage][1], model_.res_b[stage][1],
                              3, 1,   // kernel1=3, kernel2=1
                              1);      // dilation=1 (could increase per stage)
+        ENC_LOG("after SEANet stage %d: ", stage); print_shape("x", x);
     }
 
     // After SEANet: [512, T/960] at 25 Hz
@@ -414,10 +451,12 @@ bool CodecEncoder::encode(
                         model_.bottleneck_contract_w,
                         model_.bottleneck_contract_b,
                         3, 1);   // k3, stride 1 → [512, T/960]
+    ENC_LOG("after bottleneck: "); print_shape("x", x);
 
     // ── Transformer ──
     // Transpose from [T, C] to [C, T] for mul_mat-based transformer
     int n_pos = ggml_nelements(x) / cfg.HIDDEN_SIZE;
+    ENC_LOG("before transformer: n_pos=%d\n", n_pos);
     {
         int ch = cfg.HIDDEN_SIZE;
         x = ggml_reshape_2d(ctx0, x, n_pos, ch);      // [T, C] → [T, C]
@@ -441,6 +480,7 @@ bool CodecEncoder::encode(
     }
 
     // After downsample conv: [T', C] format (ne[0]=T', ne[1]=512)
+    ENC_LOG("after downsample: "); print_shape("x", x);
     // Transpose to [C, T'] for mul_mat quantizer projections
     x = ggml_transpose(ctx0, x);
     x = ggml_cont(ctx0, x);
@@ -523,6 +563,8 @@ bool CodecEncoder::encode(
     }
 
     // Compute
+    ENC_LOG(">>> calling ggml_backend_sched_graph_compute...\n");
+    fflush(stderr);
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "graph computation failed";
         ggml_backend_sched_reset(sched);
@@ -531,16 +573,64 @@ bool CodecEncoder::encode(
         ggml_free(ctx0);
         return false;
     }
+    ENC_LOG("<<< graph_compute returned SUCCESS\n");
+    fflush(stderr);
 
     // ── Readback latent representations ──
-    int32_t cb_dim = MimiEncoderConfig::CODEBOOK_DIM;
-    std::vector<float> sem_data((size_t)n_frames * cb_dim);
-    std::vector<float> aco_data((size_t)n_frames * cb_dim);
+    // Use ggml_graph_get_tensor to get the actual computed tensor
+    // (the scheduler may redirect output tensors).
+    struct ggml_tensor * sem_out = ggml_graph_get_tensor(gf, "sem_latent");
+    struct ggml_tensor * aco_out = ggml_graph_get_tensor(gf, "aco_latent");
+    if (!sem_out || !aco_out) {
+        error_msg_ = "output tensors not found in graph";
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_free(sched);
+        release_preferred_backend(backend);
+        ggml_free(ctx0);
+        return false;
+    }
 
-    ggml_backend_tensor_get(sem_latent, sem_data.data(), 0,
-                             (size_t)n_frames * cb_dim * sizeof(float));
-    ggml_backend_tensor_get(aco_latent, aco_data.data(), 0,
-                             (size_t)n_frames * cb_dim * sizeof(float));
+    ENC_LOG("quantizer outputs:\n");
+    print_shape("sem_out", sem_out);
+    print_shape("aco_out", aco_out);
+
+    int32_t cb_dim = MimiEncoderConfig::CODEBOOK_DIM;
+    size_t sem_bytes = (size_t)sem_out->ne[1] * (size_t)sem_out->ne[0] * sizeof(float);
+    size_t aco_bytes = (size_t)aco_out->ne[1] * (size_t)aco_out->ne[0] * sizeof(float);
+    ENC_LOG("readback: sem_bytes=%zu, aco_bytes=%zu\n", sem_bytes, aco_bytes);
+
+    std::vector<float> sem_data((size_t)sem_out->ne[0] * sem_out->ne[1]);
+    std::vector<float> aco_data((size_t)aco_out->ne[0] * aco_out->ne[1]);
+
+    ENC_LOG("ggml_nbytes(sem_out)=%zu, ggml_nbytes(aco_out)=%zu\n",
+            ggml_nbytes(sem_out), ggml_nbytes(aco_out));
+    ENC_LOG("sem_out strides: nb=[%zu, %zu, %zu, %zu]\n",
+            sem_out->nb[0], sem_out->nb[1], sem_out->nb[2], sem_out->nb[3]);
+    ENC_LOG("buffer=%p, data=%p\n", (void*)sem_out->buffer, sem_out->data);
+    fflush(stderr);
+
+    // Use ggml_nbytes as the authoritative size
+    sem_bytes = ggml_nbytes(sem_out);
+    aco_bytes = ggml_nbytes(aco_out);
+
+    // On CPU backend: read directly from the tensor's data pointer.
+    // The scheduler may not expose these through ggml_backend_tensor_get
+    // correctly for scheduler-allocated output tensors.
+    {
+        ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
+        bool is_cpu = !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (is_cpu && sem_out->data && aco_out->data) {
+            memcpy(sem_data.data(), sem_out->data, sem_bytes);
+            memcpy(aco_data.data(), aco_out->data, aco_bytes);
+            ENC_LOG("readback via direct memcpy\n");
+        } else {
+            ggml_backend_tensor_get(sem_out, sem_data.data(), 0, sem_bytes);
+            ggml_backend_tensor_get(aco_out, aco_data.data(), 0, aco_bytes);
+            ENC_LOG("readback via backend API\n");
+        }
+    }
+    // Update n_frames from the actual tensor shape
+    n_frames = (int32_t)sem_out->ne[1];
 
     // Cleanup scheduler
     ggml_backend_sched_reset(sched);
@@ -554,13 +644,11 @@ bool CodecEncoder::encode(
     // Semantic path: 1 quantizer
     {
         std::vector<float> cb_data;
-        size_t cb_elems;
         {
-            // Read codebook data
-            cb_elems = (size_t)MimiEncoderConfig::CODEBOOK_SIZE * cb_dim;
-            cb_data.resize(cb_elems);
-            ggml_backend_tensor_get(model_.vq_sem_cb, cb_data.data(), 0,
-                                     cb_elems * sizeof(float));
+            if (!read_tensor_as_f32(model_.vq_sem_cb, cb_data, error_msg_)) {
+                ENC_LOG("semantic codebook read failed: %s\n", error_msg_.c_str());
+                return false;
+            }
         }
         for (int f = 0; f < n_frames; f++) {
             const float * vec = sem_data.data() + (size_t)f * cb_dim;
@@ -575,10 +663,10 @@ bool CodecEncoder::encode(
             if (!model_.vq_aco_cb[q]) continue;
 
             std::vector<float> cb_data;
-            size_t cb_elems = (size_t)MimiEncoderConfig::CODEBOOK_SIZE * cb_dim;
-            cb_data.resize(cb_elems);
-            ggml_backend_tensor_get(model_.vq_aco_cb[q], cb_data.data(), 0,
-                                     cb_elems * sizeof(float));
+            if (!read_tensor_as_f32(model_.vq_aco_cb[q], cb_data, error_msg_)) {
+                ENC_LOG("acoustic codebook %d read failed: %s\n", q, error_msg_.c_str());
+                return false;
+            }
 
             for (int f = 0; f < n_frames; f++) {
                 float * vec = aco_data.data() + (size_t)f * cb_dim;
