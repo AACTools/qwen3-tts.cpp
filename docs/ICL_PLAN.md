@@ -78,7 +78,17 @@ companion tensors, and regenerate the GGUF. Version-bump the GGUF.
 - ICL context: text_proj(text[i]) + codec_embed[i] per position
 - Padding with tts_pad when one stream runs out
 
-### Phase 3: Pipeline + CLI + C API — ✅ DONE
+### Phase 3: Pipeline + CLI + C API — ✅ DONE (after review fixes)
+
+Review found 12 issues (score 3/10 → all fixed):
+- Generation loop rebuilt as exact copy of x-vector generate()
+- forward_step outputs fixed (logits→logits, not swapped)
+- Step embedding uses codec embedding lookups (not hidden states)
+- cb1-15 prefill from code_pred_embd (not codec_embd)
+- Ref-text slice strips 5-token tail (not 2)
+- Special-token suppression added
+- C API properly inside extern "C" + implemented
+- CLI ref_text properly declared and wired
 - `Qwen3TTS::synthesize_in_context(text, ref_audio, ref_text, params)`:
   loads audio → extracts speaker embedding → encodes to codec tokens →
   tokenizes transcript → calls `generate_icl()` → decodes to audio
