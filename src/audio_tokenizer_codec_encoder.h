@@ -121,7 +121,9 @@ struct MimiEncoderModel {
 
     // Codebooks: [codebook_size, codebook_dim]
     struct ggml_tensor * vq_sem_cb = nullptr;
+    struct ggml_tensor * vq_sem_usage = nullptr;  // null = already centroids (v2 GGUF)
     struct ggml_tensor * vq_aco_cb[15] = {};
+    struct ggml_tensor * vq_aco_usage[15] = {};   // null = already centroids (v2 GGUF)
 };
 
 // ─── Encoder ─────────────────────────────────────────────────────────

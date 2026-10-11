@@ -248,6 +248,53 @@ static bool read_tensor_as_f32(
     return true;
 }
 
+/// Read an encoder codebook and normalize EMA sums → centroids.
+/// The ORIGINAL tokenizer GGUF stores raw embed_sum (NOT normalized);
+/// the decoder normalizes at load time. The encoder must do the same.
+/// If the GGUF already contains normalized centroids (v2), this is a no-op
+/// (detected by checking if a companion usage tensor exists).
+static bool read_encoder_codebook_normalized(
+    struct ggml_tensor * codebook,
+    struct ggml_tensor * usage,  // may be nullptr (v2 GGUF)
+    std::vector<float> & out,
+    std::string & error)
+{
+    if (!read_tensor_as_f32(codebook, out, error)) {
+        return false;
+    }
+
+    // If no usage tensor, the codebook is already normalized (v2 GGUF)
+    if (!usage) {
+        return true;
+    }
+
+    // Read usage tensor and normalize: centroid = embed_sum / usage
+    std::vector<float> usage_data;
+    if (!read_tensor_as_f32(usage, usage_data, error)) {
+        return false;
+    }
+
+    // Codebook shape: [dim, entries] → out is [entries × dim]
+    // Usage shape: [entries] (one count per entry)
+    int32_t dim = (int32_t)codebook->ne[0];
+    int32_t entries = (int32_t)codebook->ne[1];
+
+    if ((int32_t)usage_data.size() != entries) {
+        error = "codebook/usage size mismatch";
+        return false;
+    }
+
+    for (int32_t e = 0; e < entries; e++) {
+        float count = usage_data[e];
+        if (count < 1e-5f) count = 1e-5f;
+        for (int32_t d = 0; d < dim; d++) {
+            out[(size_t)e * dim + d] /= count;
+        }
+    }
+
+    return true;
+}
+
 
 /// Permute a Q/K/V weight from kyutai strided-head layout to standard
 /// block layout. Weight is [hidden, hidden] = [512, 512].
@@ -391,9 +438,13 @@ bool CodecEncoder::load(const std::string & model_path) {
         if (sname == "tok_enc.vq_acoustic.input_proj.weight")  model_.vq_aco_in = tensor;
         if (sname == "tok_enc.vq_acoustic.output_proj.weight") model_.vq_aco_out = tensor;
         if (sname == "tok_enc.vq_semantic.0.codebook") model_.vq_sem_cb = tensor;
+        if (sname == "tok_enc.vq_semantic.0.usage") model_.vq_sem_usage = tensor;
         for (int q = 0; q < 15; q++) {
             if (sname == "tok_enc.vq_acoustic." + std::to_string(q) + ".codebook") {
                 model_.vq_aco_cb[q] = tensor;
+            }
+            if (sname == "tok_enc.vq_acoustic." + std::to_string(q) + ".usage") {
+                model_.vq_aco_usage[q] = tensor;
             }
         }
     }
@@ -747,7 +798,8 @@ bool CodecEncoder::encode(
     {
         std::vector<float> cb_data;
         {
-            if (!read_tensor_as_f32(model_.vq_sem_cb, cb_data, error_msg_)) {
+            if (!read_encoder_codebook_normalized(model_.vq_sem_cb, model_.vq_sem_usage,
+                     cb_data, error_msg_)) {
                 ENC_LOG("semantic codebook read failed: %s\n", error_msg_.c_str());
                 return false;
             }
@@ -765,7 +817,8 @@ bool CodecEncoder::encode(
             if (!model_.vq_aco_cb[q]) continue;
 
             std::vector<float> cb_data;
-            if (!read_tensor_as_f32(model_.vq_aco_cb[q], cb_data, error_msg_)) {
+            if (!read_encoder_codebook_normalized(model_.vq_aco_cb[q], model_.vq_aco_usage[q],
+                     cb_data, error_msg_)) {
                 ENC_LOG("acoustic codebook %d read failed: %s\n", q, error_msg_.c_str());
                 return false;
             }
