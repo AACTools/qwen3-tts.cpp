@@ -901,6 +901,14 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
     // ref_len / total_len * audio_len gives the proportional cut point.
     int64_t total_samples = (int64_t)audio_all.size();
     int64_t cut_point = (int64_t)((double)n_ref_frames / total_frames * total_samples);
+    // Add a small buffer to skip the transition artifact (the model
+    // generates a brief "eee" sound between the reference reproduction
+    // and the target speech). 0.15s at 24kHz ≈ 3600 samples.
+    cut_point += 3600;
+    if (cut_point >= total_samples) {
+        // Cut too aggressive — fall back to proportional only
+        cut_point = (int64_t)((double)n_ref_frames / total_frames * total_samples);
+    }
     if (cut_point < total_samples) {
         audio_all.erase(audio_all.begin(), audio_all.begin() + cut_point);
     }
