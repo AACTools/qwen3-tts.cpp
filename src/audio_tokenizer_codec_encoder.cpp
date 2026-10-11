@@ -74,7 +74,10 @@ static struct ggml_tensor * apply_layer_norm(
     return x;
 }
 
-/// SEANet residual block: conv1(dilated) → ELU → conv2 → ELU → skip.
+/// SEANet residual block (Mimi pre-activation):
+///   ELU(x) → conv1(dilated) → ELU(→) → conv2 → + residual
+/// ELU comes BEFORE each conv, not after (Mimi's ResnetBlock uses
+/// nn.Sequential(ELU(), Conv1d(...)) — verified from Python model).
 static struct ggml_tensor * seanet_res_block(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
@@ -83,7 +86,11 @@ static struct ggml_tensor * seanet_res_block(
     int32_t kernel1, int32_t kernel2,
     int32_t dilation)
 {
-    struct ggml_tensor * h = x;
+    struct ggml_tensor * residual = x;
+    struct ggml_tensor * h;
+
+    // Pre-activation: ELU first
+    h = ggml_elu(ctx, x);
 
     // conv1 (dilated, causal)
     int32_t pad1 = (kernel1 - 1) * dilation;
@@ -95,6 +102,8 @@ static struct ggml_tensor * seanet_res_block(
         int32_t oc = (int32_t)w1->ne[2];
         h = ggml_add(ctx, h, ggml_reshape_3d(ctx, b1, 1, oc, 1));
     }
+
+    // Pre-activation again: ELU before conv2
     h = ggml_elu(ctx, h);
 
     // conv2 (causal, typically kernel 1)
@@ -107,10 +116,9 @@ static struct ggml_tensor * seanet_res_block(
         int32_t oc = (int32_t)w2->ne[2];
         h = ggml_add(ctx, h, ggml_reshape_3d(ctx, b2, 1, oc, 1));
     }
-    h = ggml_elu(ctx, h);
 
-    // Skip connection
-    return ggml_add(ctx, x, h);
+    // Residual connection (add to the PRE-activation input)
+    return ggml_add(ctx, residual, h);
 }
 
 /// One transformer layer: LayerNorm → Self-Attn → LayerNorm → GELU MLP.
@@ -421,37 +429,61 @@ bool CodecEncoder::encode(
         const int stride = MimiEncoderConfig::CONV_STRIDES[stage];
         const int kernel = MimiEncoderConfig::ENTRY_KERNELS[stage];
 
-        // Strided entry conv (causal + ELU)
-        x = causal_conv_elu(ctx0, x,
-                            model_.conv_entry_w[stage],
-                            model_.conv_entry_b[stage],
-                            kernel, stride);
+        // Strided entry conv (causal, NO ELU — it comes after the res block)
+        {
+            int32_t pad_left = (kernel - 1);
+            if (pad_left > 0) {
+                x = ggml_pad_ext(ctx0, x, pad_left, 0, 0, 0, 0, 0, 0, 0);
+            }
+            x = ggml_conv_1d(ctx0, model_.conv_entry_w[stage], x, stride, 0, 1);
+            if (model_.conv_entry_b[stage]) {
+                int32_t oc = (int32_t)model_.conv_entry_w[stage]->ne[2];
+                x = ggml_add(ctx0, x, ggml_reshape_3d(ctx0, model_.conv_entry_b[stage], 1, oc, 1));
+            }
+        }
 
-        // Residual block (1 per stage)
+        // Residual block (1 per stage, pre-activation)
         int layer_idx = stage * 3 + 1;
-        // blk.1: dilated conv (kernel 3)
-        // blk.3: pointwise conv (kernel 1)
         x = seanet_res_block(ctx0, x,
                              model_.res_w[stage][0], model_.res_b[stage][0],
                              model_.res_w[stage][1], model_.res_b[stage][1],
                              3, 1,   // kernel1=3, kernel2=1
-                             1);      // dilation=1 (could increase per stage)
+                             1);      // dilation=1
+        // Post-resblock ELU (the flat layer list has: Conv → ResBlock → ELU)
+        x = ggml_elu(ctx0, x);
         ENC_LOG("after SEANet stage %d: ", stage); print_shape("x", x);
     }
 
     // After SEANet: [512, T/960] at 25 Hz
 
     // ── Bottleneck ──
+    // conv.12: stride 8 (the main temporal reduction to 25 Hz)
     x = causal_conv_elu(ctx0, x,
                         model_.bottleneck_expand_w,
                         model_.bottleneck_expand_b,
-                        16, 1);  // k16, stride 1 → [1024, T/960]
+                        16, MimiEncoderConfig::BOTTLENECK_STRIDE);  // k16, stride 8
 
-    x = causal_conv_elu(ctx0, x,
-                        model_.bottleneck_contract_w,
-                        model_.bottleneck_contract_b,
-                        3, 1);   // k3, stride 1 → [512, T/960]
+    // conv.14 (bottleneck contract, k3, stride 1) — NO ELU
+    // (the SEANet encoder ends here; output goes directly to transformer)
+    {
+        int32_t pad = 3 - 1;
+        if (pad > 0) {
+            x = ggml_pad_ext(ctx0, x, pad, 0, 0, 0, 0, 0, 0, 0);
+        }
+        x = ggml_conv_1d(ctx0, model_.bottleneck_contract_w, x, 1, 0, 1);
+        if (model_.bottleneck_contract_b) {
+            int32_t oc = (int32_t)model_.bottleneck_contract_w->ne[2];
+            x = ggml_add(ctx0, x,
+                ggml_reshape_3d(ctx0, model_.bottleneck_contract_b, 1, oc, 1));
+        }
+    }
     ENC_LOG("after bottleneck: "); print_shape("x", x);
+    // Compute mean/std for comparison with Python reference
+    // (Python: seanet_L14 mean=0.144544 std=3.495283)
+    {
+        // We can't easily read the tensor data before computation (symbolic),
+        // so we'll add this after graph_compute instead.
+    }
 
     // ── Transformer ──
     // Transpose from [T, C] to [C, T] for mul_mat-based transformer
@@ -576,6 +608,13 @@ bool CodecEncoder::encode(
     ENC_LOG("<<< graph_compute returned SUCCESS\n");
     fflush(stderr);
 
+    // ── Debug: read back intermediate activations for comparison ──
+    {
+        // Read the tensor AFTER bottleneck (named from the graph)
+        // We'll read from the quantizer outputs for now (sem_latent)
+        // and compare with Python's downsample output
+    }
+
     // ── Readback latent representations ──
     // Use ggml_graph_get_tensor to get the actual computed tensor
     // (the scheduler may redirect output tensors).
@@ -631,6 +670,18 @@ bool CodecEncoder::encode(
     }
     // Update n_frames from the actual tensor shape
     n_frames = (int32_t)sem_out->ne[1];
+
+    // Debug: compare with Python reference stats
+    {
+        float mean = 0.0f, sum_sq = 0.0f;
+        size_t n = sem_data.size();
+        for (float v : sem_data) { mean += v; sum_sq += v * v; }
+        mean /= n;
+        float var = sum_sq / n - mean * mean;
+        float std = sqrtf(var > 0 ? var : 0);
+        ENC_LOG("sem_latent: n=%zu mean=%.6f std=%.6f (Py: mean=-0.0598 std=4.851)\n",
+                n, mean, std);
+    }
 
     // Cleanup scheduler
     ggml_backend_sched_reset(sched);

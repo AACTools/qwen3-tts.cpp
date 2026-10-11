@@ -42,9 +42,10 @@ static bool test_codebook_parity(const std::string & model_path);
 static bool test_config_defaults() {
     MimiEncoderConfig cfg;
     CHECK(cfg.NUM_STAGES == 4, "4 SEANet stages");
-    CHECK(cfg.CONV_STRIDES[0] == 8 && cfg.CONV_STRIDES[1] == 6 &&
-          cfg.CONV_STRIDES[2] == 5 && cfg.CONV_STRIDES[3] == 4,
-          "strides 8,6,5,4");
+    CHECK(cfg.CONV_STRIDES[0] == 1 && cfg.CONV_STRIDES[1] == 4 &&
+          cfg.CONV_STRIDES[2] == 5 && cfg.CONV_STRIDES[3] == 6,
+          "strides 1,4,5,6 (reversed from upsampling_ratios)");
+    CHECK(cfg.BOTTLENECK_STRIDE == 8, "bottleneck stride 8");
     CHECK(cfg.HIDDEN_SIZE == 512, "hidden 512");
     CHECK(cfg.NUM_LAYERS == 8, "8 transformer layers");
     CHECK(cfg.NUM_HEADS == 8, "8 heads");

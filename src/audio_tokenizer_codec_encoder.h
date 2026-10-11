@@ -28,10 +28,15 @@ class GGUFLoader;
 // ─── Configuration ───────────────────────────────────────────────────
 
 struct MimiEncoderConfig {
-    // SEANet
+    // SEANet — strides are REVERSED from upsampling_ratios [8,6,5,4],
+    // verified from Python reference intermediate shapes:
+    //   conv.0: stride 1 (no temporal reduction, just 1→64 channels)
+    //   conv.3: stride 4, conv.6: stride 5, conv.9: stride 6
+    //   conv.12 (bottleneck): stride 8 → 25 Hz
     static constexpr int NUM_STAGES = 4;
-    static constexpr int CONV_STRIDES[NUM_STAGES] = {8, 6, 5, 4};
+    static constexpr int CONV_STRIDES[NUM_STAGES] = {1, 4, 5, 6};
     static constexpr int ENTRY_KERNELS[NUM_STAGES] = {7, 8, 10, 12};
+    static constexpr int BOTTLENECK_STRIDE = 8;
     static constexpr int RES_KERNEL = 3;     // residual conv kernel
     static constexpr int RES_KERNEL_2 = 1;   // second residual conv kernel
     static constexpr int COMPRESS = 2;       // residual bottleneck factor
