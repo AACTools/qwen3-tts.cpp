@@ -33,7 +33,7 @@ def main():
 
     print(f"Encoding {n_samples} samples...")
     # Encode using the tokenizer's encode method
-    result = tokenizer.encode(audio)
+    result = tokenizer.encode(audio, sr=24000)
 
     # The result should be codec tokens
     if isinstance(result, dict) and "codes" in result:
