@@ -162,9 +162,12 @@ static struct ggml_tensor * encoder_transformer_layer(
     K = ggml_reshape_3d(ctx, K, head_dim, n_heads, n_positions);
     V = ggml_reshape_3d(ctx, V, head_dim, n_heads, n_positions);
 
-    // RoPE positions [0, 1, ..., n_positions-1]
+    // RoPE positions [0, 1, ..., n_positions-1] — unique name per layer
+    // (all layers share the same VALUES but need distinct graph nodes)
+    char pos_name[32];
+    snprintf(pos_name, sizeof(pos_name), "enc_pos_%d", layer_idx);
     struct ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_positions);
-    ggml_set_name(pos, "enc_pos");
+    ggml_set_name(pos, pos_name);
     ggml_set_input(pos);
 
     Q = ggml_rope_ext(ctx, Q, pos, nullptr,
@@ -627,14 +630,18 @@ bool CodecEncoder::encode(
     // Set input audio
     ggml_backend_tensor_set(inp_audio, audio, 0, (size_t)n_samples * sizeof(float));
 
-    // Set RoPE positions
+    // Set RoPE positions for ALL layers
     {
-        struct ggml_tensor * pos_t = ggml_graph_get_tensor(gf, "enc_pos");
-        if (pos_t) {
-            std::vector<int32_t> pos_data(n_pos);
-            for (int i = 0; i < n_pos; i++) pos_data[i] = i;
-            ggml_backend_tensor_set(pos_t, pos_data.data(), 0,
-                                     (size_t)n_pos * sizeof(int32_t));
+        std::vector<int32_t> pos_data(n_pos);
+        for (int i = 0; i < n_pos; i++) pos_data[i] = i;
+        for (int layer = 0; layer < 8; layer++) {
+            char name[32];
+            snprintf(name, sizeof(name), "enc_pos_%d", layer);
+            struct ggml_tensor * pos_t = ggml_graph_get_tensor(gf, name);
+            if (pos_t) {
+                ggml_backend_tensor_set(pos_t, pos_data.data(), 0,
+                                         (size_t)n_pos * sizeof(int32_t));
+            }
         }
     }
 

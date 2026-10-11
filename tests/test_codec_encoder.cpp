@@ -98,6 +98,17 @@ static bool test_load_and_encode(const std::string & model_path) {
 
     fprintf(stderr, "PASS: encode (%d frames, %zu tokens)\n",
             n_frames, codec_tokens.size());
+
+    // Print all tokens for full comparison with Python
+    fprintf(stderr, "ALL TOKENS (%d frames × 16 codebooks):\n", n_frames);
+    for (int f = 0; f < n_frames; f++) {
+        fprintf(stderr, "frame %2d:", f);
+        for (int cb = 0; cb < 16; cb++) {
+            fprintf(stderr, " %d", codec_tokens[(size_t)f * 16 + cb]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     tests_passed++;
     return true;
 }
