@@ -13,6 +13,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
     fprintf(stderr, "      --ref-text <text>  Transcript (enables ICL cloning)\n");
+    fprintf(stderr, "      --ref-code <file>  Pre-computed codec tokens (exact Python encoder)\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
@@ -41,6 +42,7 @@ int main(int argc, char ** argv) {
     std::string output_file = "output.wav";
     std::string reference_audio;
     std::string ref_text;
+    std::string ref_code_file;  // pre-computed codec tokens (bypasses C++ encoder)
     
     qwen3_tts::tts_params params;
     
@@ -81,6 +83,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             ref_text = argv[i];
+        } else if (arg == "--ref-code") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing ref-code file\n");
+                return 1;
+            }
+            ref_code_file = argv[i];
         } else if (arg == "--temperature") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing temperature value\n");
@@ -181,6 +189,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Synthesizing with voice cloning: \"%s\"\n", text.c_str());
         fprintf(stderr, "Reference audio: %s\n", reference_audio.c_str());
         if (!ref_text.empty()) {
+            if (!ref_code_file.empty()) {
+                setenv("QWEN3_TTS_REF_CODE", ref_code_file.c_str(), 1);
+            }
             fprintf(stderr, "ICL mode with transcript: %zu chars\n", ref_text.size());
             result = tts.synthesize_in_context(text, reference_audio, ref_text, params);
         } else {

@@ -762,10 +762,34 @@ tts_result Qwen3TTS::synthesize_in_context(const std::string & text,
     }
     std::vector<int32_t> ref_codec_tokens;
     int32_t n_ref_frames = 0;
-    if (!codec_encoder_.encode(ref_samples.data(), (int32_t)ref_samples.size(),
-                                ref_codec_tokens, n_ref_frames)) {
-        result.error_msg = "Failed to encode reference audio: " + std::string(codec_encoder_.get_error());
-        return result;
+
+    // Check for pre-computed codec tokens (exact Python encoder output)
+    // This bypasses the C++ encoder's F16 precision loss entirely.
+    const char * ref_code_path = getenv("QWEN3_TTS_REF_CODE");
+    bool loaded_precomputed = false;
+    if (ref_code_path && *ref_code_path) {
+        FILE * f = fopen(ref_code_path, "r");
+        if (f) {
+            int val;
+            while (fscanf(f, "%d", &val) == 1) {
+                ref_codec_tokens.push_back(val);
+            }
+            fclose(f);
+            n_ref_frames = (int32_t)ref_codec_tokens.size() / 16;
+            loaded_precomputed = n_ref_frames > 0;
+            if (loaded_precomputed && params.print_progress) {
+                fprintf(stderr, "ICL: loaded %d pre-computed codec frames from %s\n",
+                        n_ref_frames, ref_code_path);
+            }
+        }
+    }
+
+    if (!loaded_precomputed) {
+        if (!codec_encoder_.encode(ref_samples.data(), (int32_t)ref_samples.size(),
+                                    ref_codec_tokens, n_ref_frames)) {
+            result.error_msg = "Failed to encode reference audio: " + std::string(codec_encoder_.get_error());
+            return result;
+        }
     }
 
     if (params.print_progress) {
