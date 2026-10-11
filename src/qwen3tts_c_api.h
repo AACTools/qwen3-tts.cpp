@@ -105,3 +105,15 @@ const char* qwen3_tts_get_error(const Qwen3Tts* tts);
 #endif
 
 #endif /* QWEN3TTS_C_API_H */
+
+/* Synthesize with in-context voice cloning (ICL mode).
+ * Combines the speaker embedding AND reference codec tokens + transcript
+ * for accent/prosody-preserving cloning (not just timbre).
+ * ref_text: transcript of the reference audio (enables ICL mode).
+ * Returns NULL on failure. Caller must free with qwen3_tts_free_audio(). */
+Qwen3TtsAudio* qwen3_tts_synthesize_in_context(
+    Qwen3Tts* tts,
+    const char* text,
+    const char* reference_audio_path,
+    const char* ref_text,
+    const Qwen3TtsParams* params);

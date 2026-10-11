@@ -246,3 +246,19 @@ const char * qwen3_tts_get_error(const Qwen3Tts * tts) {
 }
 
 } // extern "C"
+
+Qwen3TtsAudio* qwen3_tts_synthesize_in_context(
+    Qwen3Tts* tts,
+    const char* text,
+    const char* reference_audio_path,
+    const char* ref_text,
+    const Qwen3TtsParams* params)
+{
+    if (!tts || !text || !reference_audio_path || !ref_text) return nullptr;
+    // ICL mode: encode reference audio to codec tokens, then use
+    // generate_icl with the transcript for full context cloning.
+    // This is a stub — the full implementation wires the codec encoder
+    // + tokenizer through Qwen3TTS pipeline.
+    fprintf(stderr, "[qwen3-tts] ICL synthesis: not yet fully wired in C API\n");
+    return nullptr;
+}

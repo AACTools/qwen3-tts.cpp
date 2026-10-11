@@ -265,6 +265,21 @@ public:
                   float repetition_penalty = 1.05f,
                   float temperature = 0.9f,
                   int32_t top_k = 50);
+
+    /// Generate speech codes with in-context voice cloning.
+    /// ref_codec_tokens: [n_ref_frames × 16] from the codec encoder.
+    /// ref_text_tokens: tokenized transcript of the reference audio.
+    /// The reference text + codec tokens are interleaved as prefill
+    /// context before the target text, carrying accent/prosody.
+    bool generate_icl(const int32_t * text_tokens, int32_t n_tokens,
+                      const int32_t * ref_text_tokens, int32_t n_ref_text,
+                      const int32_t * ref_codec_tokens, int32_t n_ref_frames,
+                      const float * speaker_embd, int32_t max_len,
+                      std::vector<int32_t> & output,
+                      int32_t language_id = 2050,
+                      float repetition_penalty = 1.05f,
+                      float temperature = 0.9f,
+                      int32_t top_k = 50);
     
     const tts_transformer_config & get_config() const { return model_.config; }
     
@@ -291,6 +306,14 @@ private:
                              std::vector<float> & prefill_embd,
                              std::vector<float> & trailing_text_hidden,
                              std::vector<float> & tts_pad_embed);
+
+    bool build_prefill_graph_icl(const int32_t * text_tokens, int32_t n_tokens,
+                                 const int32_t * ref_text_tokens, int32_t n_ref_text,
+                                 const int32_t * ref_codec_tokens, int32_t n_ref_frames,
+                                 const float * speaker_embd, int32_t language_id,
+                                 std::vector<float> & prefill_embd,
+                                 std::vector<float> & trailing_text_hidden,
+                                 std::vector<float> & tts_pad_embed);
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 

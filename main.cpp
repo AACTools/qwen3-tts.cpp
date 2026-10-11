@@ -14,6 +14,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -i, --interactive      Run in interactive loop mode (load once, generate many)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
+    fprintf(stderr, "      --ref-text <text>  Transcript of reference audio (enables ICL mode)\n");
     fprintf(stderr, "  -s, --speaker <file>   Load precomputed speaker embedding (.spk)\n");
     fprintf(stderr, "  --save-speaker <file>  Extract embedding from -r and save to file\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
@@ -76,6 +77,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             reference_audio = argv[i];
+        } else if (arg == "--ref-text") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing reference text\n");
+                return 1;
+            }
+            ref_text = argv[i];
         } else if (arg == "-s" || arg == "--speaker") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing speaker file\n");
