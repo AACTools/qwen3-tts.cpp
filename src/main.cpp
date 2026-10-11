@@ -12,6 +12,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
+    fprintf(stderr, "      --ref-text <text>  Transcript (enables ICL cloning)\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
@@ -31,6 +32,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "Example:\n");
     fprintf(stderr, "  %s -m ./models -t \"Hello, world!\" -o hello.wav\n", program);
     fprintf(stderr, "  %s -m ./models -t \"Hello!\" -r reference.wav -o cloned.wav\n", program);
+    fprintf(stderr, "  %s -m ./models -t \"Hi\" -r ref.wav --ref-text \"Transcript\" -o icl.wav\n", program);
 }
 
 int main(int argc, char ** argv) {
@@ -38,6 +40,7 @@ int main(int argc, char ** argv) {
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
+    std::string ref_text;
     
     qwen3_tts::tts_params params;
     
@@ -72,6 +75,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             reference_audio = argv[i];
+        } else if (arg == "--ref-text") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing reference text\n");
+                return 1;
+            }
+            ref_text = argv[i];
         } else if (arg == "--temperature") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing temperature value\n");
@@ -171,7 +180,12 @@ int main(int argc, char ** argv) {
     } else {
         fprintf(stderr, "Synthesizing with voice cloning: \"%s\"\n", text.c_str());
         fprintf(stderr, "Reference audio: %s\n", reference_audio.c_str());
-        result = tts.synthesize_with_voice(text, reference_audio, params);
+        if (!ref_text.empty()) {
+            fprintf(stderr, "ICL mode with transcript: %zu chars\n", ref_text.size());
+            result = tts.synthesize_in_context(text, reference_audio, ref_text, params);
+        } else {
+            result = tts.synthesize_with_voice(text, reference_audio, params);
+        }
     }
     
     if (!result.success) {

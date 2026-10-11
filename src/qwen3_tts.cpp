@@ -862,6 +862,7 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
 
     result.audio = std::move(audio_samples);
     result.sample_rate = audio_decoder_.get_config().sample_rate;
+    result.success = true;
     result.t_total_ms = get_time_ms() - t_total_start;
 
     return result;
