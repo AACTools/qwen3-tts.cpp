@@ -2982,6 +2982,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     int32_t n_past = prefill_len;
     std::vector<int32_t> frame_codes(cfg.n_codebooks);
     std::unordered_set<int32_t> generated_cb0_tokens;
+    // Repetition-loop detection state (babble tails cycle identical frames)
+    std::vector<std::vector<int32_t>> rep_frames;
+    int32_t rep_run_len = 0;
+    int32_t rep_run_start = 0;
     const int32_t suppress_start = cfg.codec_vocab_size - 1024;
     
     std::vector<float> probs(cfg.codec_vocab_size);
@@ -3073,6 +3077,41 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         
         for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
             output.push_back(frame_codes[cb]);
+        }
+
+        // Repetition-loop detection: babble tails ("lack lack lack") cycle
+        // near-identical 16-codebook frames with sampling jitter. A frame is
+        // "repetitive" when >= 10/16 codes match a frame 1-6 back (periods up
+        // to 6). Natural speech never sustains that for 5 consecutive frames.
+        rep_frames.emplace_back(frame_codes.begin(), frame_codes.end());
+        {
+            const size_t n_f = rep_frames.size();
+            bool is_rep = false;
+            for (int back = 1; back <= 6 && !is_rep && (size_t)back < n_f; ++back) {
+                int matches = 0;
+                const auto & a = rep_frames[n_f - 1];
+                const auto & b = rep_frames[n_f - 1 - back];
+                for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+                    if (a[cb] == b[cb]) ++matches;
+                }
+                if (matches >= 10) {
+                    is_rep = true;
+                }
+            }
+            if (is_rep) {
+                if (rep_run_len == 0) {
+                    rep_run_start = (int32_t)(n_f - 1);
+                }
+                ++rep_run_len;
+            } else {
+                rep_run_len = 0;
+            }
+            if (rep_run_len >= 5) {
+                fprintf(stderr, "  Repetition loop detected at frame %d, truncating %d frames\n",
+                        (int)(n_f - 1), (int)rep_run_len);
+                output.resize((size_t)rep_run_start * cfg.n_codebooks);
+                break;
+            }
         }
 
 #ifdef QWEN3_TTS_TIMING
@@ -3174,7 +3213,20 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     }
 #endif
 
-    return true;
+    
+#ifdef QWEN3_TTS_DUMP_CODES
+    if (const char * dump_path = getenv("QWEN3_TTS_DUMP_CODES")) {
+        FILE * df = fopen(dump_path, "wb");
+        if (df) {
+            int32_t n_out = (int32_t)output.size();
+            fwrite(&n_out, sizeof(int32_t), 1, df);
+            fwrite(output.data(), sizeof(int32_t), n_out, df);
+            fclose(df);
+        }
+    }
+#endif
+
+        return true;
 }
 
 bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
@@ -3185,7 +3237,9 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
                                    int32_t language_id,
                                    float repetition_penalty,
                                    float temperature,
-                                   int32_t top_k) {
+                                   int32_t top_k,
+                                   float eos_bias,
+                                   int32_t target_frames) {
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
         return false;
@@ -3242,6 +3296,10 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
     int32_t n_past = prefill_len;
     std::vector<int32_t> frame_codes(cfg.n_codebooks);
     std::unordered_set<int32_t> generated_cb0_tokens;
+    // Repetition-loop detection state (babble tails cycle identical frames)
+    std::vector<std::vector<int32_t>> rep_frames;
+    int32_t rep_run_len = 0;
+    int32_t rep_run_start = 0;
     const int32_t suppress_start = cfg.codec_vocab_size - 1024;
 
     std::vector<float> probs(cfg.codec_vocab_size);
@@ -3276,6 +3334,19 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
         } else {
             for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
                 logits[i] /= temperature;
+            }
+            // EOS logit bias: the 1.7B model under-samples EOS in ICL mode and
+            // babbles past the speech end; a small nudge makes runs terminate.
+            // Past target_frames the bias ramps up (+0.1/frame, capped +6.0)
+            // so babble trajectories are forced to end ~1-2s past the target
+            // while natural generation is untouched.
+            float eff_eos_bias = eos_bias;
+            if (target_frames > 0 && frame > target_frames) {
+                eff_eos_bias += 0.1f * (float)(frame - target_frames);
+                if (eff_eos_bias > 6.0f) eff_eos_bias = 6.0f;
+            }
+            if (eff_eos_bias != 0.0f) {
+                logits[cfg.codec_eos_id] += eff_eos_bias;
             }
             if (top_k > 0 && top_k < cfg.codec_vocab_size) {
                 std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
@@ -3328,6 +3399,41 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
             output.push_back(frame_codes[cb]);
         }
 
+        // Repetition-loop detection: babble tails ("lack lack lack") cycle
+        // near-identical 16-codebook frames with sampling jitter. A frame is
+        // "repetitive" when >= 10/16 codes match a frame 1-6 back (periods up
+        // to 6). Natural speech never sustains that for 5 consecutive frames.
+        rep_frames.emplace_back(frame_codes.begin(), frame_codes.end());
+        {
+            const size_t n_f = rep_frames.size();
+            bool is_rep = false;
+            for (int back = 1; back <= 6 && !is_rep && (size_t)back < n_f; ++back) {
+                int matches = 0;
+                const auto & a = rep_frames[n_f - 1];
+                const auto & b = rep_frames[n_f - 1 - back];
+                for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+                    if (a[cb] == b[cb]) ++matches;
+                }
+                if (matches >= 10) {
+                    is_rep = true;
+                }
+            }
+            if (is_rep) {
+                if (rep_run_len == 0) {
+                    rep_run_start = (int32_t)(n_f - 1);
+                }
+                ++rep_run_len;
+            } else {
+                rep_run_len = 0;
+            }
+            if (rep_run_len >= 5) {
+                fprintf(stderr, "  Repetition loop detected at frame %d, truncating %d frames\n",
+                        (int)(n_f - 1), (int)rep_run_len);
+                output.resize((size_t)rep_run_start * cfg.n_codebooks);
+                break;
+            }
+        }
+
         if (frame + 1 >= max_len) {
             break;
         }
@@ -3370,7 +3476,20 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
         n_past++;
     }
 
-    return true;
+    
+#ifdef QWEN3_TTS_DUMP_CODES
+    if (const char * dump_path = getenv("QWEN3_TTS_DUMP_CODES")) {
+        FILE * df = fopen(dump_path, "wb");
+        if (df) {
+            int32_t n_out = (int32_t)output.size();
+            fwrite(&n_out, sizeof(int32_t), 1, df);
+            fwrite(output.data(), sizeof(int32_t), n_out, df);
+            fclose(df);
+        }
+    }
+#endif
+
+        return true;
 }
 
 bool TTSTransformer::forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,

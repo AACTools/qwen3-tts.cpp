@@ -286,7 +286,9 @@ public:
                       int32_t language_id = 2050,
                       float repetition_penalty = 1.05f,
                       float temperature = 0.9f,
-                      int32_t top_k = 50);
+                      int32_t top_k = 50,
+                      float eos_bias = 0.0f,
+                      int32_t target_frames = 0);
     
     const tts_transformer_config & get_config() const { return model_.config; }
     
