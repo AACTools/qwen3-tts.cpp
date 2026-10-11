@@ -1315,12 +1315,14 @@ bool TTSTransformer::build_prefill_graph_icl(
     // Each position: text_proj[text[i]] + codec_embed[i] (if both exist)
     //                text_proj[text[i]] + tts_pad       (if only text)
     //                tts_pad + codec_embed[i]            (if only codec)
-    std::vector<float> icl_embed((size_t)icl_len * hidden_size);
+    std::vector<float> icl_embed((size_t)icl_len * hidden_size, 0.0f);
     for (int32_t i = 0; i < icl_len; i++) {
         float * dst = icl_embed.data() + (size_t)i * hidden_size;
 
-        // Start with tts_pad
-        memcpy(dst, tts_pad_embed.data(), hidden_size * sizeof(float));
+        // ICL positions: text_embed + codec_embed (NO tts_pad overlay)
+        // This matches the Python reference: the base prefix (positions
+        // 3-8) has the tts_pad/bos overlay, but ICL context positions
+        // are just the sum of projected text + codec embeddings.
 
         // Add text embedding if available
         if (i < n_text) {
