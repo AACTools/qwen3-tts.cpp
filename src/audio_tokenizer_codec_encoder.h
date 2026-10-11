@@ -138,6 +138,7 @@ public:
 
     const char * get_error() const { return error_msg_.c_str(); }
     const MimiEncoderConfig & config() const { return model_.config; }
+    const std::map<std::string, struct ggml_tensor *> & model_tensors() const { return model_.tensors; }
 
 private:
     MimiEncoderModel model_;
