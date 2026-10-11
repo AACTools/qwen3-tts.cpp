@@ -1168,23 +1168,14 @@ bool TTSTransformer::build_prefill_graph_icl(
         return false;
     }
 
-    // Codec prefill tokens (think/lang sequence)
-    std::vector<int32_t> codec_prefill_tokens;
-    if (language_id < 0) {
-        codec_prefill_tokens = {
-            cfg.codec_nothink_id,
-            cfg.codec_think_bos_id,
-            cfg.codec_think_eos_id,
-        };
-    } else {
-        codec_prefill_tokens = {
-            cfg.codec_think_id,
-            cfg.codec_think_bos_id,
-            language_id,
-            cfg.codec_think_eos_id,
-        };
-    }
-
+    // Codec prefill tokens — ICL mode: NO language token (3 tokens)
+    // to match Python's generate_voice_clone which uses the no-language
+    // path. Adding language_id shifts everything by 1 and breaks alignment.
+    std::vector<int32_t> codec_prefill_tokens = {
+        cfg.codec_nothink_id,
+        cfg.codec_think_bos_id,
+        cfg.codec_think_eos_id,
+    };
     std::vector<float> codec_prefill_embed;
     if (!lookup_embedding_rows(model_.codec_embd, codec_prefill_tokens.data(),
                                (int32_t)codec_prefill_tokens.size(),
@@ -1237,6 +1228,11 @@ bool TTSTransformer::build_prefill_graph_icl(
         memcpy(prefill_embd.data(), role_embed.data(), role_embed.size() * sizeof(float));
         memcpy(prefill_embd.data() + (size_t)3 * hidden_size,
                codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
+
+        // NO fused transition — Python goes directly from base prefix
+        // to ICL context. The first ICL position (position 8) has
+        // text[0] + codec_bos (handled by the codec_bos prepend in the
+        // codec stream).
     }
 
     // ── Build the ICL context: additive interleaving of text ⊕ codec ──
@@ -1267,15 +1263,24 @@ bool TTSTransformer::build_prefill_graph_icl(
     }
     combined_text.push_back(cfg.tts_eos_token_id); // text stream ends with EOS
 
-    // Prepare codec embeddings for reference frames
-    // cb0 uses talker.codec_embd, cb1-15 use code_predictor.codec_embd[i-1]
-    // Sum all 16 codebook embeddings per frame
-    std::vector<float> codec_frame_embeds((size_t)n_ref_frames * hidden_size, 0.0f);
+    // Prepare codec embeddings: codec_bos PREPENDED + reference frames
+    // (Python line 1989: codec_embed = cat([codec_bos_embed, codec_embed], dim=1))
+    // So the codec stream is [codec_bos, frame0, frame1, ..., frameN]
+    // making it (n_ref_frames + 1) positions long.
+    int32_t n_codec_total = n_ref_frames + 1;  // +1 for codec_bos
+    std::vector<float> codec_frame_embeds((size_t)n_codec_total * hidden_size, 0.0f);
     {
-        // First frame: codec_bos + sum of codebook embeddings
-        // Subsequent: sum of codebook embeddings per frame
+        // Position 0: codec_bos embedding from the talker's codec_embd
+        {
+            float * dst = codec_frame_embeds.data();
+            if (!lookup_single_embedding_row(model_.codec_embd, cfg.codec_bos_id, dst)) {
+                return false;
+            }
+        }
+
+        // Positions 1+: reference codec frames
         for (int32_t f = 0; f < n_ref_frames; f++) {
-            float * dst = codec_frame_embeds.data() + (size_t)f * hidden_size;
+            float * dst = codec_frame_embeds.data() + (size_t)(f + 1) * hidden_size;
 
             // cb0: talker.codec_embd
             int32_t cb0_token = ref_codec_tokens[(size_t)f * 16 + 0];
@@ -1315,24 +1320,31 @@ bool TTSTransformer::build_prefill_graph_icl(
     // Each position: text_proj[text[i]] + codec_embed[i] (if both exist)
     //                text_proj[text[i]] + tts_pad       (if only text)
     //                tts_pad + codec_embed[i]            (if only codec)
+    // Use n_codec_total (includes codec_bos) for interleaving
+    n_codec = n_codec_total;
+    icl_len = std::max(n_text, n_codec);
+
+    // Interleaving (Python lines 2014-2018):
+    //   if text > codec: text[:codec_len] + codec, then text[codec_len:] as trailing
+    //   if codec > text: text padded with tts_pad to codec length, then text + codec
     std::vector<float> icl_embed((size_t)icl_len * hidden_size, 0.0f);
     for (int32_t i = 0; i < icl_len; i++) {
         float * dst = icl_embed.data() + (size_t)i * hidden_size;
 
-        // ICL positions: text_embed + codec_embed (NO tts_pad overlay)
-        // This matches the Python reference: the base prefix (positions
-        // 3-8) has the tts_pad/bos overlay, but ICL context positions
-        // are just the sum of projected text + codec embeddings.
-
-        // Add text embedding if available
+        // Text embedding or tts_pad filler
         if (i < n_text) {
             const float * trow = text_proj_all.data() + (size_t)i * hidden_size;
             for (int32_t h = 0; h < hidden_size; h++) {
                 dst[h] += trow[h];
             }
+        } else {
+            // Text ran out — Python pads with tts_pad (line 2017)
+            for (int32_t h = 0; h < hidden_size; h++) {
+                dst[h] += tts_pad_embed[h];
+            }
         }
 
-        // Add codec embedding if available
+        // Codec embedding
         if (i < n_codec) {
             const float * crow = codec_frame_embeds.data() + (size_t)i * hidden_size;
             for (int32_t h = 0; h < hidden_size; h++) {
@@ -1350,6 +1362,35 @@ bool TTSTransformer::build_prefill_graph_icl(
     // Trailing text hidden (for step embedding during generation)
     // In ICL mode, this is typically empty since all text is in the prefill
     trailing_text_hidden.clear();
+
+    // Debug: dump prefill stats for comparison with Python reference
+    {
+        size_t total_len = prefill_embd.size() / hidden_size;
+        fprintf(stderr, "[ICL-prefill] %zu positions x %d hidden\n", total_len, hidden_size);
+        fprintf(stderr, "[ICL-prefill] overall: mean=%.6f std=%.6f\n",
+                0.0, 0.0); // TODO compute
+        // Compute stats
+        double sum = 0, sum_sq = 0;
+        for (float v : prefill_embd) { sum += v; sum_sq += (double)v * v; }
+        double mean = sum / prefill_embd.size();
+        double var = sum_sq / prefill_embd.size() - mean * mean;
+        fprintf(stderr, "[ICL-prefill] overall: mean=%.6f std=%.6f\n", mean, sqrt(var));
+
+        // Per-position (key positions matching Python dump)
+        int key_positions[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 50, 60, 70};
+        for (int pos : key_positions) {
+            if ((size_t)pos < total_len) {
+                const float * p = prefill_embd.data() + (size_t)pos * hidden_size;
+                double psum = 0, psq = 0;
+                for (int h = 0; h < hidden_size; h++) { psum += p[h]; psq += (double)p[h] * p[h]; }
+                double pmean = psum / hidden_size;
+                double pstd = sqrt(psq / hidden_size - pmean * pmean);
+                double pnorm = sqrt(psq);
+                fprintf(stderr, "[ICL-prefill] pos %3d: mean=%9.5f std=%9.5f norm=%9.4f\n",
+                        pos, pmean, pstd, pnorm);
+            }
+        }
+    }
 
     return true;
 }
