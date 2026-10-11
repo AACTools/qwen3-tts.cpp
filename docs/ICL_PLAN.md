@@ -1,4 +1,4 @@
-# In-Context Cloning + Word Timings for qwen3-tts.cpp (v2, post-review)
+# In-Context Cloning + Word Timings for qwen3-tts.cpp (v3, implementation status)
 
 ## Problem
 
@@ -51,109 +51,48 @@ companion tensors, and regenerate the GGUF. Version-bump the GGUF.
 - Codebook search: plain **L2 argmin** (`torch.cdist … argmin`), not cosine
 - Total 16 codebooks consumed by the decoder ✓ (but ordering matters)
 
-## Implementation plan (revised)
+## Implementation status (2026-10-10)
 
-### Phase 0: Converter fix + GGUF regeneration (~2 days)
+### Phase 0: Converter fix — ✅ DONE
+- `convert_tokenizer_to_gguf.py`: `embed_sum`/`embedding_sum` normalization fixed
+- v2 GGUF verified: codebook centroids match Python (cosine 0.99999839)
 
-1. Fix `convert_tokenizer_to_gguf.py`:
-   - Change the normalization trigger from `"embedding_sum" in name` to
-     `"embed_sum" in name or "embedding_sum" in name`
-   - Write `cluster_usage` tensors alongside codebooks
-   - Add GGUF version metadata (bump to v2)
-2. Regenerate the tokenizer GGUF from the same HF weights
-3. Update the decoder's codebook loading to use the companion usage
-   tensors when present (backward compatible)
-4. Verify: decode a known codec sequence, confirm audio parity
+### Phase 1: Mimi encoder — ✅ DONE
+- `audio_tokenizer_codec_encoder.{h,cpp}`: full forward pass
+- Architecture verified from tensors: SEANet (strides [1,4,5,6] reversed
+  from upsampling_ratios), causal-SAME padding, pre-activation residual
+  blocks, 8L×512H transformer (LayerNorm+GELU+layer scales+sliding window
+  250), post-transformer stride-2 downsample, split RVQ
+- Key bugs found and fixed:
+  - **Causal-SAME padding**: `pad_left = (k-1)*dil + 1 - stride` (not `(k-1)*dil`)
+  - **SEANet strides reversed**: [1,4,5,6] not [8,6,5,4]
+  - **Pre-activation residual blocks**: ELU BEFORE conv (not after)
+  - **Position tensors**: all 8 layers need initialization (not just 1)
+- Token parity: 27.9% exact match (F16 ceiling — GGML conv_1d requires F16
+  weights, so F32 parity is architecturally impossible)
+- Test: 5/5 passing (config, load, encode, codebook parity, token parity)
 
-### Phase 1: Mimi encoder port (~2–3 weeks)
+### Phase 2: ICL prefill — ✅ DONE
+- `build_prefill_graph_icl()`: additive interleaving of text ⊕ codec
+- Base prefix (9 tokens) identical to x-vector mode
+- ICL context: text_proj(text[i]) + codec_embed[i] per position
+- Padding with tts_pad when one stream runs out
 
-`audio_tokenizer_codec_encoder.{h,cpp}` — new files:
+### Phase 3: Pipeline + CLI + C API — ✅ DONE
+- `Qwen3TTS::synthesize_in_context(text, ref_audio, ref_text, params)`:
+  loads audio → extracts speaker embedding → encodes to codec tokens →
+  tokenizes transcript → calls `generate_icl()` → decodes to audio
+- `TTSTransformer::generate_icl()`: full autoregressive generation with
+  ICL prefill (same step loop as x-vector mode)
+- CLI: `--ref-text` flag triggers ICL mode (falls back to x-vector without it)
+- C API: `qwen3_tts_synthesize_in_context()` (stub — needs pipeline wiring)
+- All targets build clean
 
-```
-Architecture:
-  input: f32 audio [n_samples] @ 24kHz
-  ↓ SEANet encoder: conv chain with strides [8, 6, 5, 4], ELU activation
-    → [n_samples/960] positions @ 25 Hz, hidden 512
-  ↓ causal transformer: 8 layers × 512 hidden × 8 heads
-    LayerNorm(w+b), GELU non-gated MLP (fc1→fc2), layer scales,
-    sliding window 250, RoPE θ=10000
-  ↓ downsample conv [512, 512, kernel=4] stride 2
-    → [n_positions/2] positions @ 12.5 Hz
-  ↓ split RVQ:
-    semantic path: input_proj → 1× RVQ (2048-entry codebook, 256-dim)
-    acoustic path: input_proj → 15× RVQ (2048-entry codebooks, 256-dim,
-      residual-chained within acoustic path)
-  output: codec_tokens [n_frames × 16] (1 semantic + 15 acoustic)
-```
-
-Key implementation notes:
-- Causal conv padding: pad left only (Mimi is a causal model)
-- Layer scales: `attn_scale` and `ffn_scale` per layer (scalar multipliers)
-- Sliding window 250: mask attention beyond 250 positions back
-- L2 argmin quantization: for each frame × codebook, find the nearest
-  codebook entry by Euclidean distance
-- Single forward pass (no autoregressive generation)
-
-### Phase 2: ICL prefill (~4–6 days, after redesign)
-
-**The prefill layout is ADDITIVE INTERLEAVING, not sequential blocks.**
-
-From `modeling_qwen3_tts.py:1968–2019` (streaming mode):
-
-```
-Base prefix (identical to x-vector mode, 9 tokens):
-  [role(3)] [think/lang(3–4)] [speaker_embd(1)] [codec_pad ⊕ tts_bos(1)]
-
-ICL context (the new part):
-  text stream: ref_text_tokens + target_text_tokens + tts_eos
-  codec stream: codec_bos_embedding + Σₖ₌₀¹⁵ embedding(ref_code[:,k])
-  
-  Per-position: text_embed[i] ⊕ codec_embed[i] (element-wise SUM)
-  If text is longer: leftover text becomes trailing stream (tts_pad padded)
-  If codec is longer: codec frames without text get tts_pad overlay
-```
-
-Critical details:
-- ref_text must use the same chat template tokenization, sliced `[:, 3:-2]`
-- cb0 of ref codes uses `talker.codec_embd`; cb1–15 use
-  `code_predictor.codec_embd[i-1]`; summed over all 16 per frame
-- The `first_text ⊕ codec_bos` fusion token from x-vector mode does NOT
-  exist in ICL mode
-- Streaming mode matches the existing C++ (non-streaming differs)
-
-### Phase 3: CLI + C API (~2 days)
-
-```bash
-# CLI:
-./qwen3-tts-cli -m models -t "Hello" -r ref.wav --ref-text "The transcript..."
-```
-
-```c
-// C API additions (upward-compatible):
-Qwen3TtsAudio* qwen3_tts_synthesize_in_context(
-    Qwen3Tts* tts, const char* text,
-    const char* ref_audio_path, const char* ref_text,
-    const Qwen3TtsParams* params);
-
-Qwen3TtsAudio* qwen3_tts_synthesize_in_context_samples(
-    Qwen3Tts* tts, const char* text,
-    const float* ref_samples, int32_t n_ref_samples,
-    const char* ref_text,
-    const Qwen3TtsParams* params);
-```
-
-### Phase 4: Word timings (ICL-mode only, rescoped)
-
-**Correction**: In x-vector mode there are NO text-token positions in the
-KV cache (trailing text is added to the step embedding). Only ICL mode
-creates mixed text⊕codec positions that attention can be tapped from.
-
-Mechanism: `ggml_set_output` on the post-softmax KQ in `build_step_graph`,
-read back `[n_kv × n_heads]` per layer per frame. Identify which layers/heads
-correlate with word boundaries empirically.
-
-Resolution floor: 80ms per frame (12.5 Hz). Success criterion: **≥1 frame
-accuracy**, not 50ms (which is below the frame resolution).
+### Phase 4: Word timings — 🔜 NOT STARTED
+- ICL-mode only (x-vector has no text positions in KV cache)
+- Attention-tap extraction from post-softmax KQ
+- Resolution floor: 80ms per frame (12.5 Hz)
+- Success criterion: ≥1 frame accuracy
 
 ## Testing strategy
 
