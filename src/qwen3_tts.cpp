@@ -832,18 +832,31 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
     result.t_generate_ms = get_time_ms() - t_generate_start;
 
     int n_codebooks = transformer_.get_config().n_codebooks;
-    int n_frames = (int)speech_codes.size() / n_codebooks;
+    int n_gen_frames = (int)speech_codes.size() / n_codebooks;
 
     if (params.print_progress) {
-        fprintf(stderr, "ICL speech codes: %d frames × %d codebooks\n", n_frames, n_codebooks);
+        fprintf(stderr, "ICL speech codes: %d generated + %d reference frames × %d codebooks\n",
+                n_gen_frames, n_ref_frames, n_codebooks);
     }
 
-    if (n_frames == 0) {
+    if (n_gen_frames == 0) {
         result.error_msg = "No speech codes generated";
         return result;
     }
 
-    // Step 4: Decode speech codes to audio (same as x-vector mode)
+    // Concatenate ref_code + generated_code for decoding (Python line 148)
+    // The model is trained to first REPRODUCE the reference, then generate
+    // the target. Decoding both together gives continuous audio.
+    int total_frames = n_ref_frames + n_gen_frames;
+    std::vector<int32_t> codes_for_decode;
+    codes_for_decode.reserve((size_t)total_frames * n_codebooks);
+    codes_for_decode.insert(codes_for_decode.end(),
+                            ref_codec_tokens,
+                            ref_codec_tokens + (size_t)n_ref_frames * n_codebooks);
+    codes_for_decode.insert(codes_for_decode.end(),
+                            speech_codes.begin(), speech_codes.end());
+
+    // Decode combined codes
     if (!decoder_loaded_) {
         if (!audio_decoder_.load_model(decoder_model_path_)) {
             result.error_msg = "Failed to load audio decoder: " + audio_decoder_.get_error();
@@ -853,14 +866,27 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
     }
 
     int64_t t_decode_start = get_time_ms();
-    std::vector<float> audio_samples;
-    if (!audio_decoder_.decode(speech_codes.data(), n_frames, audio_samples)) {
+    std::vector<float> audio_all;
+    if (!audio_decoder_.decode(codes_for_decode.data(), total_frames, audio_all)) {
         result.error_msg = "Failed to decode speech codes: " + audio_decoder_.get_error();
         return result;
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
 
-    result.audio = std::move(audio_samples);
+    // Cut the reference portion from the audio (Python lines 158-161)
+    // ref_len / total_len * audio_len gives the proportional cut point.
+    int64_t total_samples = (int64_t)audio_all.size();
+    int64_t cut_point = (int64_t)((double)n_ref_frames / total_frames * total_samples);
+    if (cut_point < total_samples) {
+        audio_all.erase(audio_all.begin(), audio_all.begin() + cut_point);
+    }
+
+    if (params.print_progress) {
+        fprintf(stderr, "ICL: decoded %lld samples, cut %lld (ref), kept %zu\n",
+                (long long)total_samples, (long long)cut_point, audio_all.size());
+    }
+
+    result.audio = std::move(audio_all);
     result.sample_rate = audio_decoder_.get_config().sample_rate;
     result.success = true;
     result.t_total_ms = get_time_ms() - t_total_start;
