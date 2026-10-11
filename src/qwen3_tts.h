@@ -39,6 +39,9 @@ struct tts_params {
     // Repetition penalty for CB0 token generation (HuggingFace style)
     float repetition_penalty = 1.05f;
 
+    // EOS logit bias for ICL generation (combats babble-past-end on 1.7B)
+    float eos_bias = 0.0f;
+
     // Language ID for codec (2050=en, 2069=ru, 2055=zh, 2058=ja, 2064=ko, 2053=de, 2061=fr, 2054=es)
     int32_t language_id = 2050;
 

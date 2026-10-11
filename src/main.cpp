@@ -119,6 +119,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.repetition_penalty = std::stof(argv[i]);
+        } else if (arg == "--eos-bias") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing eos-bias value\n");
+                return 1;
+            }
+            params.eos_bias = std::stof(argv[i]);
         } else if (arg == "-l" || arg == "--language") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing language value\n");

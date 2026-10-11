@@ -844,14 +844,56 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
 
     int64_t t_generate_start = get_time_ms();
     std::vector<int32_t> speech_codes;
-    if (!transformer_.generate_icl(text_tokens.data(), (int32_t)text_tokens.size(),
-                                     ref_text_tokens.data(), (int32_t)ref_text_tokens.size(),
-                                     ref_codec_tokens, n_ref_frames,
-                                     speaker_embedding, params.max_audio_tokens, speech_codes,
-                                     params.language_id, params.repetition_penalty,
-                                     params.temperature, params.top_k)) {
-        result.error_msg = "Failed to generate speech codes (ICL): " + transformer_.get_error();
-        return result;
+    // Retry loop: the 1.7B model in ICL mode often fails to emit EOS and
+    // babbles toward the frame cap (verified in F32 PyTorch too — not a
+    // quantization issue). Clean runs end at roughly the target text's
+    // expected length (speaking-rate prior from the reference: ref frames
+    // per ref char). Accept only runs that end early AND within 2x the
+    // expected length; retry up to 3 attempts, keeping the closest to
+    // expected as fallback.
+    const int64_t n_codebooks_cfg = transformer_.get_config().n_codebooks;
+    const double ref_char_rate = n_ref_frames > 0 && !reference_text.empty()
+        ? (double)n_ref_frames / (double)reference_text.size()
+        : 0.8;
+    int64_t expected_frames = (int64_t)((double)text.size() * ref_char_rate);
+    if (expected_frames < 8) expected_frames = 8;
+    bool gen_clean = false;
+    std::vector<int32_t> best_codes;
+    int64_t best_delta = INT64_MAX;
+    const int max_gen_attempts = 4;
+    for (int attempt = 1; attempt <= max_gen_attempts; ++attempt) {
+        speech_codes.clear();
+        if (!transformer_.generate_icl(text_tokens.data(), (int32_t)text_tokens.size(),
+                                         ref_text_tokens.data(), (int32_t)ref_text_tokens.size(),
+                                         ref_codec_tokens, n_ref_frames,
+                                         speaker_embedding, params.max_audio_tokens, speech_codes,
+                                         params.language_id, params.repetition_penalty,
+                                         params.temperature, params.top_k, params.eos_bias,
+                                         (int32_t)(expected_frames * 5 / 4))) {
+            result.error_msg = "Failed to generate speech codes (ICL): " + transformer_.get_error();
+            return result;
+        }
+        const int64_t n_gen = (int64_t)speech_codes.size() / n_codebooks_cfg;
+        const int64_t delta = llabs(n_gen - expected_frames);
+        fprintf(stderr, "ICL attempt %d/%d: %lld frames (expected ~%lld)\n",
+                attempt, max_gen_attempts, (long long)n_gen, (long long)expected_frames);
+        if (n_gen < params.max_audio_tokens && n_gen * 2 <= 3 * expected_frames) {
+            gen_clean = true;
+            break;
+        }
+        if (delta < best_delta) {
+            best_delta = delta;
+            best_codes = speech_codes;
+        }
+        transformer_.clear_kv_cache();
+    }
+    if (!gen_clean) {
+        fprintf(stderr, "ICL: no clean termination; using run closest to expected length\n");
+        speech_codes = std::move(best_codes);
+        if (speech_codes.empty()) {
+            result.error_msg = "No speech codes generated (ICL)";
+            return result;
+        }
     }
     result.t_generate_ms = get_time_ms() - t_generate_start;
 
@@ -897,25 +939,56 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
 
-    // Cut the reference portion from the audio (Python lines 158-161)
-    // ref_len / total_len * audio_len gives the proportional cut point.
+    // Cut the reference echo from the audio.
+    // The model reproduces the reference FIRST, occupying exactly n_ref_frames
+    // codec frames (12Hz at 24kHz = 2000 samples/frame). A proportional cut
+    // (n_ref/total) breaks when generation overruns with babble: the ratio
+    // shrinks and the cut lands inside the transition artifact ("underwater"
+    // start). Cut deterministically at the frame boundary plus a small buffer
+    // to skip the transition "eee".
+    const int32_t out_sample_rate = audio_decoder_.get_config().sample_rate;
+    const int64_t samples_per_frame = (int64_t)(out_sample_rate > 0 ? out_sample_rate / 12 : 2000);
     int64_t total_samples = (int64_t)audio_all.size();
-    int64_t cut_point = (int64_t)((double)n_ref_frames / total_frames * total_samples);
-    // Add a small buffer to skip the transition artifact (the model
-    // generates a brief "eee" sound between the reference reproduction
-    // and the target speech). 0.15s at 24kHz ≈ 3600 samples.
-    cut_point += 3600;
+    int64_t cut_point = (int64_t)n_ref_frames * samples_per_frame;
+    // Buffer: 0.15s to skip the transition artifact
+    cut_point += (int64_t)(0.15 * (out_sample_rate > 0 ? out_sample_rate : 24000));
     if (cut_point >= total_samples) {
-        // Cut too aggressive — fall back to proportional only
-        cut_point = (int64_t)((double)n_ref_frames / total_frames * total_samples);
+        // Cut too aggressive — fall back to frame boundary only
+        cut_point = (int64_t)n_ref_frames * samples_per_frame;
     }
-    if (cut_point < total_samples) {
+    if (cut_point > 0 && cut_point < total_samples) {
         audio_all.erase(audio_all.begin(), audio_all.begin() + cut_point);
     }
 
     if (params.print_progress) {
         fprintf(stderr, "ICL: decoded %lld samples, cut %lld (ref), kept %zu\n",
                 (long long)total_samples, (long long)cut_point, audio_all.size());
+    }
+
+    // Babble-tail bound: ICL mimics the reference speaking rate, so
+    // ref frames/char predicts the target length well. Cap at 1.35x the
+    // expected duration; babble runs (verified in F32 PyTorch too — not a
+    // quantization issue) overshoot 3-5x and are bounded by this cap.
+    {
+        const int32_t sr = audio_decoder_.get_config().sample_rate;
+        const double ref_char_rate = n_ref_frames > 0 && !reference_text.empty()
+            ? (double)n_ref_frames / (double)reference_text.size()
+            : 0.8;
+        double expected_sec = (double)text.size() * ref_char_rate / 12.0;
+        if (expected_sec < 0.75) expected_sec = 0.75;
+        const int64_t cap = (int64_t)(expected_sec * 1.35 * sr);
+        if (cap > 0 && cap < (int64_t)audio_all.size()) {
+            // 50ms fade-out to avoid a click
+            const int64_t fade = sr / 20;
+            for (int64_t j = 0; j < fade && cap - fade + j < (int64_t)audio_all.size(); ++j) {
+                audio_all[cap - fade + j] *= (float)(1.0 - (double)j / fade);
+            }
+            audio_all.resize(cap);
+            if (params.print_progress) {
+                fprintf(stderr, "ICL: capped audio at %.2fs (expected %.2fs)\n",
+                        (double)cap / sr, expected_sec);
+            }
+        }
     }
 
     result.audio = std::move(audio_all);
