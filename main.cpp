@@ -231,6 +231,9 @@ int main(int argc, char ** argv) {
         if (has_precomputed) {
             fprintf(stderr, "Synthesizing with precomputed voice: \"%s\"\n", current_text.c_str());
             result = tts.synthesize_with_embedding(current_text, precomputed_emb, params);
+        } else if (!reference_audio.empty() && ref_text) {
+            fprintf(stderr, "Synthesizing with ICL voice cloning: \"%s\"\n", current_text.c_str());
+            result = tts.synthesize_in_context(current_text, reference_audio, ref_text, params);
         } else if (!reference_audio.empty()) {
             fprintf(stderr, "Synthesizing with voice cloning: \"%s\"\n", current_text.c_str());
             result = tts.synthesize_with_voice(current_text, reference_audio, params);

@@ -183,6 +183,7 @@ target_link_libraries(qwen3_tts PUBLIC
     tts_transformer
     audio_tokenizer_encoder
     audio_tokenizer_decoder
+    codec_encoder
     Threads::Threads
 )
 if(WIN32)

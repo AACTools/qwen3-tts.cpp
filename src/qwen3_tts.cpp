@@ -711,4 +711,160 @@ bool save_audio_file(const std::string & path, const std::vector<float> & sample
     return true;
 }
 
+
+tts_result Qwen3TTS::synthesize_in_context(const std::string & text,
+                                             const std::string & reference_audio,
+                                             const std::string & reference_text,
+                                             const tts_params & params) {
+    tts_result result;
+
+    if (!models_loaded_) {
+        result.error_msg = "Models not loaded";
+        return result;
+    }
+
+    // Load reference audio
+    std::vector<float> ref_samples;
+    int ref_sample_rate;
+    if (!load_audio_file(reference_audio, ref_samples, ref_sample_rate)) {
+        result.error_msg = "Failed to load reference audio: " + reference_audio;
+        return result;
+    }
+    const int target_rate = 24000;
+    if (ref_sample_rate != target_rate) {
+        std::vector<float> resampled;
+        resample_linear(ref_samples.data(), (int)ref_samples.size(), ref_sample_rate, resampled, target_rate);
+        ref_samples = std::move(resampled);
+    }
+
+    // Extract speaker embedding (same as x-vector mode)
+    if (!encoder_loaded_) {
+        if (!audio_encoder_.load_model(tts_model_path_)) {
+            result.error_msg = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+            return result;
+        }
+        encoder_loaded_ = true;
+    }
+    std::vector<float> speaker_embedding;
+    if (!audio_encoder_.encode(ref_samples.data(), (int32_t)ref_samples.size(), speaker_embedding)) {
+        result.error_msg = "Failed to extract speaker embedding: " + audio_encoder_.get_error();
+        return result;
+    }
+
+    // Encode reference audio to codec tokens using the Mimi encoder
+    if (!codec_encoder_loaded_) {
+        // The codec encoder loads from the same tokenizer GGUF as the decoder
+        if (!codec_encoder_.load(decoder_model_path_)) {
+            result.error_msg = "Failed to load codec encoder: " + std::string(codec_encoder_.get_error());
+            return result;
+        }
+        codec_encoder_loaded_ = true;
+    }
+    std::vector<int32_t> ref_codec_tokens;
+    int32_t n_ref_frames = 0;
+    if (!codec_encoder_.encode(ref_samples.data(), (int32_t)ref_samples.size(),
+                                ref_codec_tokens, n_ref_frames)) {
+        result.error_msg = "Failed to encode reference audio: " + std::string(codec_encoder_.get_error());
+        return result;
+    }
+
+    if (params.print_progress) {
+        fprintf(stderr, "ICL: %d codec frames from %zu samples (%.1fs)\n",
+                n_ref_frames, ref_samples.size(),
+                (float)ref_samples.size() / target_rate);
+        fprintf(stderr, "ICL: reference text: %zu chars\n", reference_text.size());
+    }
+
+    return synthesize_icl_internal(text, speaker_embedding.data(),
+                                    ref_codec_tokens.data(), n_ref_frames,
+                                    reference_text, params, result);
+}
+
+tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
+                                               const float * speaker_embedding,
+                                               const int32_t * ref_codec_tokens,
+                                               int32_t n_ref_frames,
+                                               const std::string & reference_text,
+                                               const tts_params & params,
+                                               tts_result & result) {
+    int64_t t_total_start = get_time_ms();
+
+    // Step 1: Tokenize target text
+    std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(text);
+    if (text_tokens.empty()) {
+        result.error_msg = "Failed to tokenize text";
+        return result;
+    }
+
+    // Step 2: Tokenize reference text
+    std::vector<int32_t> ref_text_tokens = tokenizer_.encode_for_tts(reference_text);
+    if (ref_text_tokens.empty()) {
+        result.error_msg = "Failed to tokenize reference text";
+        return result;
+    }
+
+    if (params.print_progress) {
+        fprintf(stderr, "ICL: %zu target tokens, %zu ref text tokens, %d ref codec frames\n",
+                text_tokens.size(), ref_text_tokens.size(), n_ref_frames);
+    }
+
+    // Step 3: Generate speech codes with ICL context
+    if (!transformer_loaded_) {
+        if (!transformer_.load_model(tts_model_path_)) {
+            result.error_msg = "Failed to reload TTS transformer: " + transformer_.get_error();
+            return result;
+        }
+        transformer_loaded_ = true;
+    }
+    transformer_.clear_kv_cache();
+
+    int64_t t_generate_start = get_time_ms();
+    std::vector<int32_t> speech_codes;
+    if (!transformer_.generate_icl(text_tokens.data(), (int32_t)text_tokens.size(),
+                                     ref_text_tokens.data(), (int32_t)ref_text_tokens.size(),
+                                     ref_codec_tokens, n_ref_frames,
+                                     speaker_embedding, params.max_audio_tokens, speech_codes,
+                                     params.language_id, params.repetition_penalty,
+                                     params.temperature, params.top_k)) {
+        result.error_msg = "Failed to generate speech codes (ICL): " + transformer_.get_error();
+        return result;
+    }
+    result.t_generate_ms = get_time_ms() - t_generate_start;
+
+    int n_codebooks = transformer_.get_config().n_codebooks;
+    int n_frames = (int)speech_codes.size() / n_codebooks;
+
+    if (params.print_progress) {
+        fprintf(stderr, "ICL speech codes: %d frames × %d codebooks\n", n_frames, n_codebooks);
+    }
+
+    if (n_frames == 0) {
+        result.error_msg = "No speech codes generated";
+        return result;
+    }
+
+    // Step 4: Decode speech codes to audio (same as x-vector mode)
+    if (!decoder_loaded_) {
+        if (!audio_decoder_.load_model(decoder_model_path_)) {
+            result.error_msg = "Failed to load audio decoder: " + audio_decoder_.get_error();
+            return result;
+        }
+        decoder_loaded_ = true;
+    }
+
+    int64_t t_decode_start = get_time_ms();
+    std::vector<float> audio_samples;
+    if (!audio_decoder_.decode(speech_codes.data(), n_frames, audio_samples)) {
+        result.error_msg = "Failed to decode speech codes: " + audio_decoder_.get_error();
+        return result;
+    }
+    result.t_decode_ms = get_time_ms() - t_decode_start;
+
+    result.audio = std::move(audio_samples);
+    result.sample_rate = audio_decoder_.get_config().sample_rate;
+    result.t_total_ms = get_time_ms() - t_total_start;
+
+    return result;
+}
+
 } // namespace qwen3_tts
