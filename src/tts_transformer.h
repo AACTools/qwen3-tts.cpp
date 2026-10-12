@@ -204,6 +204,9 @@ public:
 
     // Release all model/runtime resources
     void unload_model();
+
+    // Enable [ICL-prefill] debug dumps (development aid)
+    void set_debug_dump(bool enabled) { debug_dump_ = enabled; }
     
     // Initialize KV cache
     bool init_kv_cache(int32_t n_ctx);
@@ -366,6 +369,9 @@ private:
     std::vector<float> last_hidden_;
     std::vector<ggml_fp16_t> embd_row_fp16_scratch_;
     std::mt19937 rng_{std::random_device{}()};
+
+    // Enable [ICL-prefill] debug dumps (development aid)
+    bool debug_dump_ = false;
     CoreMLCodePredictor coreml_code_predictor_;
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;

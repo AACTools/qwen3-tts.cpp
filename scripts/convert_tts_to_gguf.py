@@ -192,8 +192,8 @@ class Qwen3TTSConverter:
         self.codec_bos_id = talker_config.get("codec_bos_id", 2149)
         self.codec_eos_id = talker_config.get("codec_eos_token_id", 2150)
 
-        # Model name
-        self.model_name = "Qwen3-TTS-12Hz-0.6B"
+        # Model name (derived from talker width)
+        self.model_name = "Qwen3-TTS-12Hz-1.7B" if self.hidden_size > 1024 else "Qwen3-TTS-12Hz-0.6B"
 
     def _map_tensor_name(self, hf_name: str) -> str | None:
         """Map HuggingFace tensor name to GGML convention."""
