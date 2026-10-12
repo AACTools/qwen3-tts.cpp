@@ -49,6 +49,7 @@ struct tts_params {
 
 // TTS generation result
 struct tts_result {
+
     // Generated audio samples (24kHz, mono)
     std::vector<float> audio;
     
