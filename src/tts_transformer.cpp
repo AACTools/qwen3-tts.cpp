@@ -1150,7 +1150,7 @@ bool TTSTransformer::build_prefill_graph_icl(
     const int32_t * text_tokens, int32_t n_tokens,
     const int32_t * ref_text_tokens, int32_t n_ref_text,
     const int32_t * ref_codec_tokens, int32_t n_ref_frames,
-    const float * speaker_embd, int32_t language_id,
+    const float * speaker_embd, int32_t /*language_id*/,  // ICL prefill has no language token
     std::vector<float> & prefill_embd,
     std::vector<float> & trailing_text_hidden,
     std::vector<float> & tts_pad_embed)
@@ -1390,13 +1390,10 @@ bool TTSTransformer::build_prefill_graph_icl(
     // In ICL mode, this is typically empty since all text is in the prefill
     trailing_text_hidden.clear();
 
-    // Debug: dump prefill stats for comparison with Python reference
-    {
+    if (debug_dump_) {
         size_t total_len = prefill_embd.size() / hidden_size;
         fprintf(stderr, "[ICL-prefill] %zu positions x %d hidden\n", total_len, hidden_size);
-        fprintf(stderr, "[ICL-prefill] overall: mean=%.6f std=%.6f\n",
-                0.0, 0.0); // TODO compute
-        // Compute stats
+        // Overall stats
         double sum = 0, sum_sq = 0;
         for (float v : prefill_embd) { sum += v; sum_sq += (double)v * v; }
         double mean = sum / prefill_embd.size();
@@ -1717,8 +1714,6 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
     const int n_kv_head = cfg.n_key_value_heads;
     const int head_dim = cfg.head_dim;
     const int hidden_size = cfg.hidden_size;               // talker hidden (input dim)
-    const int cp_hidden = cfg.code_pred_hidden_size;       // code predictor hidden
-    const int cp_inter = cfg.code_pred_intermediate_size;
     const float eps = cfg.rms_norm_eps;
     const int n_layer = cfg.code_pred_layers;
     const int n_codebooks = cfg.n_codebooks;
@@ -2001,7 +1996,6 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t n_past, 
     const int n_kv_head = cfg.n_key_value_heads;
     const int head_dim = cfg.head_dim;
     const int hidden_size = cfg.hidden_size;
-    const int cp_hidden = cfg.code_pred_hidden_size;
     const float eps = cfg.rms_norm_eps;
     const float rope_theta = cfg.code_pred_rope_theta;
     const int n_layer = cfg.code_pred_layers;
@@ -3329,23 +3323,29 @@ bool TTSTransformer::generate_icl(const int32_t * text_tokens, int32_t n_tokens,
             }
         }
 
+        // EOS logit bias: the 1.7B model under-samples EOS in ICL mode and
+        // babbles past the speech end (issue #21); a small nudge makes runs
+        // terminate. Past target_frames the bias ramps up (+0.1/frame, capped
+        // +6.0) so babble trajectories are forced to end ~1-2s past the
+        // target while natural generation is untouched. Applied to raw
+        // logits in greedy mode and post-temperature-scaled logits in
+        // sampling mode (identical to no-bias behaviour when eos_bias=0).
+        float eff_eos_bias = eos_bias;
+        if (target_frames > 0 && frame > target_frames) {
+            eff_eos_bias += 0.1f * (float)(frame - target_frames);
+            if (eff_eos_bias > 6.0f) eff_eos_bias = 6.0f;
+        }
+
         // Sample cb0 (identical to x-vector)
         int32_t next_token;
         if (temperature <= 0.0f) {
+            if (eff_eos_bias != 0.0f) {
+                logits[cfg.codec_eos_id] += eff_eos_bias;
+            }
             next_token = argmax(logits.data(), cfg.codec_vocab_size);
         } else {
             for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
                 logits[i] /= temperature;
-            }
-            // EOS logit bias: the 1.7B model under-samples EOS in ICL mode and
-            // babbles past the speech end; a small nudge makes runs terminate.
-            // Past target_frames the bias ramps up (+0.1/frame, capped +6.0)
-            // so babble trajectories are forced to end ~1-2s past the target
-            // while natural generation is untouched.
-            float eff_eos_bias = eos_bias;
-            if (target_frames > 0 && frame > target_frames) {
-                eff_eos_bias += 0.1f * (float)(frame - target_frames);
-                if (eff_eos_bias > 6.0f) eff_eos_bias = 6.0f;
             }
             if (eff_eos_bias != 0.0f) {
                 logits[cfg.codec_eos_id] += eff_eos_bias;

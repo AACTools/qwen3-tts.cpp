@@ -877,7 +877,8 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
         const int64_t delta = llabs(n_gen - expected_frames);
         fprintf(stderr, "ICL attempt %d/%d: %lld frames (expected ~%lld)\n",
                 attempt, max_gen_attempts, (long long)n_gen, (long long)expected_frames);
-        if (n_gen < params.max_audio_tokens && n_gen * 2 <= 3 * expected_frames) {
+        const int64_t min_frames = expected_frames / 4 > 4 ? expected_frames / 4 : 4;
+        if (n_gen >= min_frames && n_gen < params.max_audio_tokens && n_gen * 2 <= 3 * expected_frames) {
             gen_clean = true;
             break;
         }
@@ -947,7 +948,14 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
     // start). Cut deterministically at the frame boundary plus a small buffer
     // to skip the transition "eee".
     const int32_t out_sample_rate = audio_decoder_.get_config().sample_rate;
-    const int64_t samples_per_frame = (int64_t)(out_sample_rate > 0 ? out_sample_rate / 12 : 2000);
+    // Codec frame rate is 12.5 Hz (80ms frames = 1920 samples @ 24kHz).
+    // The model's echo of the reference runs slightly past the codec frame
+    // boundary, and the transition re-articulation scales with reference
+    // length: add an 80-sample (3.3ms) per-frame margin on top of the fixed
+    // 0.15s buffer below. (A bare frame-boundary cut audibly clips the
+    // transition into the first target words.)
+    const int64_t samples_per_frame =
+        (int64_t)(out_sample_rate > 0 ? out_sample_rate / 12.5 : 1920) + 80;
     int64_t total_samples = (int64_t)audio_all.size();
     int64_t cut_point = (int64_t)n_ref_frames * samples_per_frame;
     // Buffer: 0.15s to skip the transition artifact
@@ -974,7 +982,7 @@ tts_result Qwen3TTS::synthesize_icl_internal(const std::string & text,
         const double ref_char_rate = n_ref_frames > 0 && !reference_text.empty()
             ? (double)n_ref_frames / (double)reference_text.size()
             : 0.8;
-        double expected_sec = (double)text.size() * ref_char_rate / 12.0;
+        double expected_sec = (double)text.size() * ref_char_rate / 12.5;
         if (expected_sec < 0.75) expected_sec = 0.75;
         const int64_t cap = (int64_t)(expected_sec * 1.35 * sr);
         if (cap > 0 && cap < (int64_t)audio_all.size()) {
