@@ -274,7 +274,11 @@ public:
                   int32_t language_id = 2050,
                   float repetition_penalty = 1.05f,
                   float temperature = 0.9f,
-                  int32_t top_k = 50);
+                  int32_t top_k = 50,
+                  const int32_t * instruct_tokens = nullptr,
+                  int32_t n_instruct = 0,
+                  float eos_bias = 0.0f,
+                  int32_t target_frames = 0);
 
     /// Generate speech codes with in-context voice cloning.
     /// ref_codec_tokens: [n_ref_frames × 16] from the codec encoder.
@@ -317,7 +321,9 @@ private:
                              const float * speaker_embd, int32_t language_id,
                              std::vector<float> & prefill_embd,
                              std::vector<float> & trailing_text_hidden,
-                             std::vector<float> & tts_pad_embed);
+                             std::vector<float> & tts_pad_embed,
+                             const int32_t * instruct_tokens = nullptr,
+                             int32_t n_instruct = 0);
 
     bool build_prefill_graph_icl(const int32_t * text_tokens, int32_t n_tokens,
                                  const int32_t * ref_text_tokens, int32_t n_ref_text,
